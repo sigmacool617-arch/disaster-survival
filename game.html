@@ -1880,6 +1880,7 @@ function mpRefresh(o, m) {
 function mpConnect() {
   const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
   MP.ws = new WebSocket(proto + location.host + '/?room=' + encodeURIComponent(ST.get('ch_room') || 'Главный'));
+  MP.ws.onerror = () => { if (ERRS++ < 3) alert('Нет связи с сервером мультиплеера'); };
   MP.ws.onopen = () => { MP.ws.send(JSON.stringify({ t: 'hello', name: ST.get('ch_name') || 'Игрок', uid: UID })); CHATL.style.display = ''; CHATB.style.display = ''; };
   MP.ws.onmessage = e => {
     const m = JSON.parse(e.data);
@@ -2043,6 +2044,10 @@ function sendChat() { const t = CHATI.value.trim(); if (t && MP.ws && MP.ws.read
 CHATI.addEventListener('keydown', e => { e.stopPropagation(); if (e.key === 'Enter') sendChat(); else if (e.key === 'Escape') closeChat(); });
 addEventListener('keydown', e => { if (e.code === 'KeyT' && MP.ws && CHATI.style.display === 'none') { e.preventDefault(); openChat(); } });
 /* Запрет выделения текста и системного меню при долгом касании: мешало водить машину на телефоне */
+/* Окна с текстом ошибок: чтобы было видно, на чём ломается вход в мультиплеер (не больше трёх) */
+let ERRS = 0;
+addEventListener('error', e => { if (ERRS++ < 3) alert('Ошибка в игре: ' + e.message + (e.lineno ? ' (строка ' + e.lineno + ')' : '')); });
+addEventListener('unhandledrejection', e => { if (ERRS++ < 3) alert('Ошибка: ' + ((e.reason && e.reason.message) || e.reason)); });
 const NOSEL = document.createElement('style');
 NOSEL.textContent = 'body, body * { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; } input, textarea { -webkit-user-select: text; user-select: text; } canvas, button { touch-action: none; }';
 document.head.appendChild(NOSEL);
