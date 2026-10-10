@@ -1616,13 +1616,13 @@ function binPut(st, it) {   /* из инвентаря в бак */
 function drawBin() {
   if (!BINK) return;
   const st = binGet(BINK[0], BINK[1], BINK[2]);
-  const cell = (it, where, i) => `<div data-bin='${where}' data-i='${i}' style='width:44px;height:44px;position:relative;background:rgba(0,0,0,.55);border:2px solid #333;border-radius:6px;box-sizing:border-box;cursor:pointer'>${it ? `<img src='${iconOf(it.id)}' style='width:32px;height:32px;image-rendering:pixelated;pointer-events:none'><b style='position:absolute;right:2px;bottom:0;font-size:11px;pointer-events:none'>${it.n > 1 ? it.n : ''}</b>` : ''}</div>`;
+  const cell = (it, where, i) => `<div data-bin='${where}' data-i='${i}' style='width:40px;height:40px;position:relative;background:rgba(0,0,0,.55);border:2px solid #333;border-radius:6px;box-sizing:border-box;cursor:pointer'>${it ? `<img src='${iconOf(it.id)}' style='width:32px;height:32px;image-rendering:pixelated;pointer-events:none'><b style='position:absolute;right:2px;bottom:0;font-size:11px;pointer-events:none'>${it.n > 1 ? it.n : ''}</b>` : ''}</div>`;
   BINO.querySelector('#binslots').innerHTML = st.slots.map((it, i) => cell(it, 'bin', i)).join('');
   BINO.querySelector('#invslots').innerHTML = HOT.map((it, i) => cell(it, 'inv', i)).join('');
 }
 const BINO = document.createElement('div');
-BINO.style.cssText = 'position:fixed;inset:0;display:none;z-index:43;background:rgba(0,0,0,.72);color:#fff;flex-direction:column;align-items:center;justify-content:center;gap:8px;font-size:14px;padding:12px;box-sizing:border-box;overflow:auto';
-BINO.innerHTML = `<h2 style='margin:0'>🗑 Мусорный бак</h2><div style='opacity:.8;font-size:13px'>Нажми ячейку бака, чтобы забрать вещь. Нажми ячейку инвентаря, чтобы положить.</div><div id='binslots' style='display:grid;grid-template-columns:repeat(6,48px);gap:4px'></div><div style='opacity:.7;font-size:13px'>Инвентарь</div><div id='invslots' style='display:grid;grid-template-columns:repeat(9,48px);gap:4px'></div><button data-close='1'>Закрыть</button>`;
+BINO.style.cssText = 'position:fixed;inset:0;display:none;z-index:43;background:rgba(0,0,0,.8);color:#fff;flex-direction:column;align-items:center;justify-content:flex-start;gap:6px;font-size:13px;padding:48px 8px 12px;box-sizing:border-box;overflow:auto';
+BINO.innerHTML = `<button data-close='1' style='position:absolute;top:8px;right:8px;padding:8px 14px;font-size:15px;z-index:2'>✕ Закрыть</button><h3 style='margin:0'>🗑 Мусорный бак</h3><div style='opacity:.8;font-size:12px;text-align:center'>Нажми ячейку бака — забрать. Нажми ячейку инвентаря — положить.</div><div id='binslots' style='display:grid;grid-template-columns:repeat(6,40px);gap:3px'></div><div style='opacity:.7;font-size:12px'>Инвентарь</div><div id='invslots' style='display:grid;grid-template-columns:repeat(9,40px);gap:3px'></div>`;
 document.body.appendChild(BINO);
 BINO.onclick = e => {
   const cl = e.target.closest('button');
@@ -1928,7 +1928,7 @@ function showMp() {
   })();
 }
 async function startMp() {
-  const name = ((document.getElementById('mpname').value || '').trim() || 'Игрок').slice(0, 16);
+  const nameEl = document.getElementById('mpname'); const name = (((nameEl && nameEl.value) || '').trim() || ST.get('ch_name') || 'Игрок').slice(0, 16);
   ST.set('ch_name', name);
   try {
     const seed = (await (await fetch('/seed?room=' + encodeURIComponent(ST.get('ch_room') || 'Главный'))).text()).trim();
