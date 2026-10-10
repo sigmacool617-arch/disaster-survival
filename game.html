@@ -1,0 +1,2053 @@
+<!DOCTYPE html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Чанки: прототип</title>
+<style>html,body{margin:0;height:100%;overflow:hidden;background:#000;font-family:system-ui,sans-serif;color:#fff}#hud{position:fixed;left:10px;top:10px;background:rgba(0,0,0,.5);padding:8px;border-radius:6px;font-size:13px;white-space:pre;pointer-events:none}#cross{position:fixed;left:50%;top:50%;width:6px;height:6px;margin:-3px;background:#fff;border-radius:50%;pointer-events:none}canvas{display:block;touch-action:none}html,body{touch-action:none}</style></head>
+<body><div id="hud"></div><div id="cross"></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+/* Disaster Survival: ядро мира, шаг 1a.
+   Генерация по сиду (не зависит от порядка создания блоков), чанки 16x16,
+   в памяти и в сохранении держатся только изменения игрока.
+   Пока не подключено к игре: шаг 1b подключит рисование чанков. */
+
+const CS = 16;   // размер чанка в блоках
+const RI = 70;   // радиус острова в блоках (диаметр около 140, примерно 9 чанков)
+const WC = {};   // настройки мира, заполняются в initWorld
+
+// Строка -> число (FNV-1a). Один и тот же сид всегда даёт один и тот же мир
+function strHash(s) {
+  let h = 2166136261 >>> 0;
+  for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
+  return h >>> 0;
+}
+
+// Детерминированное число 0..1 для точки мира. Не зависит от того, в каком порядке идёт генерация
+function rnd3(x, y, z, salt) {
+  let h = Math.imul(x, 374761393) ^ Math.imul(y, 668265263) ^ Math.imul(z, 1274126177) ^ Math.imul(WC.seed ^ salt, 2246822507);
+  h = Math.imul(h ^ (h >>> 15), 2654435761);
+  h = Math.imul(h ^ (h >>> 13), 3266489909);
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+}
+
+// Водоёмы в шаге 1a: положения от сида. Размеры поменяем на 2x2 и 5x5 чанков в шаге 2
+function initWorld(seedStr) {
+  WC.seed = strHash(seedStr);
+  const a = rnd3(1, 0, 1, 11) * Math.PI / 2, b = -Math.PI / 2 + rnd3(2, 0, 2, 12) * Math.PI / 2, c = rnd3(3, 0, 3, 13) * Math.PI * 2;
+  WC.sea = { x: Math.cos(a) * 52, z: Math.sin(a) * 52, h: 22 };
+  WC.lake = { x: Math.cos(b) * 30, z: Math.sin(b) * 30, h: 8.8 };
+  WC.river = [];
+  for (let t = 0; t <= 1; t += .02) {
+    const d = RI * (1 - t) + 8 * t;
+    WC.river.push([Math.cos(c) * d + Math.sin(t * 9) * 2, Math.sin(c) * d]);
+  }
+  COL.clear(); MODS.clear(); CHUNKS.clear();
+}
+
+// Есть ли вода в колонке (x,z): океан, озеро или речка
+function waterAt(x, z) {
+  const s = WC.sea, l = WC.lake;
+  if (x >= HOUSE.x0 - 4 && x <= HOUSE.x0 + 10 && z >= HOUSE.z0 - 4 && z <= HOUSE.z0 + 10) return false;
+  const inBox = (w, x0, z0) => Math.abs(x0 - w.x) <= w.h && Math.abs(z0 - w.z) <= w.h;
+  if (inBox(s, x, z) || inBox(l, x, z)) return true;
+  const R = WC.river;
+  for (let i = 0; i < R.length - 1; i++) {
+    const ax = R[i][0], az = R[i][1], dx = R[i + 1][0] - ax, dz = R[i + 1][1] - az;
+    const L = dx * dx + dz * dz || 1;
+    let t = ((x - ax) * dx + (z - az) * dz) / L; t = t < 0 ? 0 : t > 1 ? 1 : t;
+    if (Math.hypot(x - (ax + dx * t), z - (az + dz * t)) <= 1.5) return true;
+  }
+  return false;
+}
+
+// Колонка (x,z): глубина острова и вода. Кэшируется, чтобы не считать речку для каждого блока
+const COL = new Map();
+function colInfo(x, z) {
+  const k = x + ',' + z;
+  let c = COL.get(k);
+  if (!c) {
+    const d = Math.hypot(x, z);
+    c = d > RI ? null : { dp: Math.max(2, Math.round(100 * Math.pow(1 - d / RI, .6))), w: waterAt(x, z) };
+    COL.set(k, c);
+  }
+  return c;
+}
+
+// Тип блока, который создаёт генерация (без изменений игрока). '' = воздух
+const HOUSE = { x0: -9, z0: -9 };
+const TREE_CHANCE = .01, ROCK_CHANCE = .015, TOK = new Map(), REGROW = [];
+const TK = (rx, rz) => rx * 131071 + rz;
+function nearWater(x, z) {
+  for (let a = -16; a <= 16; a++) for (let b = -16; b <= 16; b++) if (waterAt(x + a, z + b)) return true;
+  return false;
+}
+// Корень дерева в (rx,rz): решается по сиду, не зависит от того, какой чанк загружен первым
+function treeRoot(rx, rz) {
+  const k = TK(rx, rz);
+  if (TOK.has(k)) return TOK.get(k);
+  let ok = rnd3(rx, 0, rz, 21) < TREE_CHANCE;
+  const c = ok ? colInfo(rx, rz) : null;
+  ok = !!c && !c.w && !(rx >= HOUSE.x0 - 3 && rx <= HOUSE.x0 + 9 && rz >= HOUSE.z0 - 3 && rz <= HOUSE.z0 + 9) && !(Math.abs(rx) < 3 && Math.abs(rz) < 3) && !nearWater(rx, rz);
+  TOK.set(k, ok);
+  return ok;
+}
+function treeAt(x, y, z) {
+  if (y < 1 || y > 6) return '';
+  for (let a = -2; a <= 2; a++) for (let b = -2; b <= 2; b++) {
+    if (!treeRoot(x - a, z - b)) continue;
+    if (a === 0 && b === 0 && y <= 4) return 'log';
+    if (y === 6 && a === 0 && b === 0) return 'leaves';
+    if ((y === 4 || y === 5) && Math.abs(a) <= 1 && Math.abs(b) <= 1) return 'leaves';
+  }
+  return '';
+}
+const ROCK_ROOT_CHANCE = .0009, RTOK = new Map();
+function nearWaterR(x, z, r) { for (let a = -r; a <= r; a++) for (let b = -r; b <= r; b++) if (waterAt(x + a, z + b)) return true; return false; }
+function rockRoot(rx, rz) {
+  const k = TK(rx, rz);
+  if (RTOK.has(k)) return RTOK.get(k);
+  let ok = rnd3(rx, 1, rz, 31) < ROCK_ROOT_CHANCE;
+  const c = ok ? colInfo(rx, rz) : null;
+  ok = !!c && !c.w && !(Math.abs(rx) < 3 && Math.abs(rz) < 3) && !nearWaterR(rx, rz, 3);
+  RTOK.set(k, ok);
+  return ok;
+}
+function rockAt(x, y, z) {
+  if (y !== 1) return '';
+  const c = colInfo(x, z);
+  if (!c || c.w) return '';
+  let near = false;
+  for (let a = -1; a <= 1; a++) for (let b = -1; b <= 1; b++) if (rockRoot(x - a, z - b)) near = true;
+  if (!near || (rnd3(x, 1, z, 35) >= .5 && !rockRoot(x, z))) return '';
+  return rockRoot(x, z) && rnd3(x, 1, z, 33) < .3 ? 'kremen' : 'stone';
+}
+// Дом 7x7: белый камень внизу, брёвна по углам, доски наверху. Дверь на юг, окон нет
+function houseAt(x, y, z) {
+  const i = x - HOUSE.x0, j = z - HOUSE.z0;
+  if (i < 0 || j < 0 || i > 6 || j > 6 || y < 0 || y > 6) return '';
+  if (i === 1 && j === 1 && y >= 1 && y <= 5) return 'ladder';
+  const e = i === 0 || i === 6 || j === 0 || j === 6, cr = (i === 0 || i === 6) && (j === 0 || j === 6);
+  if (y === 0) return e ? '' : 'white';
+  if (y <= 2) return (!e || (i === 3 && j === 0)) ? '' : (cr ? 'log' : 'white');
+  if (y === 3) return e ? 'log' : 'planks';
+  if (y <= 5) return e ? (cr ? 'log' : 'planks') : '';
+  return 'planks';
+}
+function structAt(x, y, z) {
+  const i = x - HOUSE.x0, j = z - HOUSE.z0;
+  if (i >= 0 && j >= 0 && i <= 6 && j <= 6) return houseAt(x, y, z);
+  return treeAt(x, y, z) || rockAt(x, y, z);
+}
+// Срубили последнее бревно дерева: листва пропадает сразу, дерево начинает расти заново
+function treeCut(x, z) {
+  if (!treeRoot(x, z)) return;
+  for (let y = 1; y <= 4; y++) if (getB(x, y, z) === 'log') return;
+  for (let a = -1; a <= 1; a++) for (let b = -1; b <= 1; b++) for (let y = 4; y <= 6; y++)
+    if (getB(x + a, y, z + b) === 'leaves') { setB(x + a, y, z + b, ''); markDirty(x + a, z + b); }
+  REGROW.push({ x, z, s: 0, t: 0 });
+}
+// Рост: каждые 60 секунд +1 бревно, на четвёртой стадии появляется листва
+function treeTick(dt) {
+  for (let i = REGROW.length - 1; i >= 0; i--) {
+    const g = REGROW[i];
+    if ((g.t += dt) < 60) continue;
+    g.t = 0; g.s++;
+    if (!getB(g.x, g.s, g.z)) { setB(g.x, g.s, g.z, 'log'); markDirty(g.x, g.z); }
+    if (g.s === 4) {
+      for (let a = -1; a <= 1; a++) for (let b = -1; b <= 1; b++) for (let y = 4; y <= 5; y++)
+        if (!getB(g.x + a, y, g.z + b)) setB(g.x + a, y, g.z + b, 'leaves');
+      if (!getB(g.x, 6, g.z)) setB(g.x, 6, g.z, 'leaves');
+      REGROW.splice(i, 1);
+    }
+  }
+}
+// Руды по слоям Y: алмаз -6..-9, серебро -10..-19, золото -20..-34, титан -35..-99, такурит -50..-99 (шанс 2% на блок в слое)
+function oreAt(x, y, z) {
+  if (y <= -6 && y >= -9 && rnd3(x, y, z, 41) < .02) return 'diamond';
+  if (y <= -10 && y >= -19 && rnd3(x, y, z, 42) < .02) return 'silver';
+  if (y <= -20 && y >= -34 && rnd3(x, y, z, 43) < .02) return 'gold';
+  if (y <= -35 && y >= -99) {
+    if (y <= -50 && rnd3(x, y, z, 44) < .008) return 'takurit';
+    if (rnd3(x, y, z, 45) < .015) return 'titan';
+  }
+  return '';
+}
+/* Заброшенная свалка: 10% чанков, в каждом три мусорных бака на поверхности (Y1) */
+const SCRAP = new Map();
+function scrapBins(cx, cz) {
+  const key = cx + ',' + cz;
+  if (SCRAP.has(key)) return SCRAP.get(key);
+  let list = null;
+  if (rnd3(cx, 999, cz, 91) < .1) {
+    const ox = cx * CS + 3 + Math.floor(rnd3(cx, 998, cz, 92) * 9), oz = cz * CS + 3 + Math.floor(rnd3(cx, 997, cz, 93) * 9);
+    list = [[ox, oz], [ox + 2, oz + 1], [ox + 1, oz + 3]];
+    if (list.some(([x, z]) => !colInfo(x, z) || colInfo(x, z).w)) list = null;
+  }
+  SCRAP.set(key, list);
+  return list;
+}
+function isScrapBin(x, y, z) {
+  if (y !== 1) return false;
+  const list = scrapBins(Math.floor(x / CS), Math.floor(z / CS));
+  return !!list && list.some(([a, b]) => a === x && b === z);
+}
+function blockAt(x, y, z) {
+  const sct = structAt(x, y, z);
+  if (sct) return sct;
+  if (y === 1 && isScrapBin(x, y, z)) return 'bin';
+  const c = colInfo(x, z);
+  if (!c || y > 0 || y < -c.dp) return '';
+  if (y === 0) return c.w ? 'water' : 'grass';
+  if (y === -1 && c.w) return 'water';
+  if (y >= -3) return 'dirt';
+  if (y === -100) return 'bedrock';
+  if (y <= -4) {
+    if (y >= -5 || (y <= -10 && rnd3(x, y, z, 46) < .5)) return 'white';
+    const o = oreAt(x, y, z); if (o) return o;
+    return rnd3(x, y, z, 7) < .1 ? 'kremen' : 'stone';
+  }
+  return rnd3(x, y, z, 7) < .1 ? 'kremen' : 'stone';
+}
+
+// Только изменения игрока: 'x,y,z' -> тип ('' = блок удалён)
+const MODS = new Map();
+function getB(x, y, z) {
+  const k = x + ',' + y + ',' + z;
+  return MODS.has(k) ? MODS.get(k) : blockAt(x, y, z);
+}
+function setB(x, y, z, t) { MODS.set(x + ',' + y + ',' + z, t || ''); if (window.mpSendBlock) window.mpSendBlock(x + ',' + y + ',' + z, t || ''); }
+
+// Прогруженные чанки: 'cx,cz'. Вокруг игрока квадрат радиусом dist чанков
+const CHUNKS = new Set();
+function chunkOf(x, z) { return [Math.floor(x / CS), Math.floor(z / CS)]; }
+function updateChunks(px, pz, dist) {
+  const [cx, cz] = chunkOf(px, pz);
+  const want = new Set(), added = [], removed = [];
+  for (let i = -dist; i <= dist; i++)
+    for (let j = -dist; j <= dist; j++) {
+      const k = (cx + i) + ',' + (cz + j);
+      want.add(k);
+      if (!CHUNKS.has(k)) { CHUNKS.add(k); added.push([cx + i, cz + j]); }
+    }
+  for (const k of [...CHUNKS]) if (!want.has(k)) { CHUNKS.delete(k); removed.push(k); }
+  return { added, removed };
+}
+
+// Сохранение: только изменения, поэтому файлы маленькие
+const saveMods = () => [...MODS];
+const loadMods = arr => { MODS.clear(); for (const [k, t] of arr) MODS.set(k, t); };
+/* Шаг 1b: прототип рисования чанков поверх world-core.js */
+const TCOL = { grass: 0x4f8a33, dirt: 0x7a5230, stone: 0x7f7f86, white: 0xe9e9e1, kremen: 0x111111, planks: 0xc08c4c, log: 0x6b4424, leaves: 0x2e7a2e, furnace: 0x8a8a8a, cauldron: 0x4a4a50, water: 0x3a8fd6 };
+const PL = ['dirt', 'stone', 'planks', 'white'];
+let SEL = 'stone';
+const FACE_DEFS = [[0, 1], [0, -1], [1, 1], [1, -1], [2, 1], [2, -1]];
+const QC = [[-.5, -.5], [.5, -.5], [.5, .5], [-.5, .5]], QI = [0, 1, 2, 0, 2, 3];
+const MESH = new Map(), DIRTY = new Set();
+let DIST = 3;
+const P = { x: 0, y: 3, z: 0 };
+let vy = 0, gr = 0, yaw = 0, pit = 0;
+const KY = {};
+
+const ren = new THREE.WebGLRenderer({ antialias: true });
+ren.setPixelRatio(Math.min(devicePixelRatio * 1.5, matchMedia('(pointer:coarse)').matches ? 2 : 2.5));
+ren.shadowMap.enabled = true; ren.shadowMap.type = THREE.PCFSoftShadowMap; ren.outputEncoding = THREE.sRGBEncoding; ren.toneMapping = THREE.ACESFilmicToneMapping; ren.toneMappingExposure = 1.05;
+ren.setSize(innerWidth, innerHeight);
+document.body.insertBefore(ren.domElement, document.body.firstChild);
+const sc = new THREE.Scene();
+sc.background = new THREE.Color(0x87b8e8);
+sc.fog = new THREE.Fog(0x87b8e8, 30, 75);
+const cam = new THREE.PerspectiveCamera(72, innerWidth / innerHeight, .05, 300);
+addEventListener('resize', () => { cam.aspect = innerWidth / innerHeight; cam.updateProjectionMatrix(); ren.setSize(innerWidth, innerHeight); });
+
+// Физика: та же логика, что в основной игре, но мир берётся из getB
+const solid = (x, y, z) => { const t = getB(x, y, z); return !!t && t !== 'water' && t !== 'ladder' && t !== 'doora'; };
+function col(x, y, z) {
+  for (let i = Math.round(x - .3); i <= Math.round(x + .29); i++)
+    for (let j = Math.round(y); j <= Math.round(y + 1.79); j++)
+      for (let k = Math.round(z - .3); k <= Math.round(z + .29); k++)
+        if (solid(i, j, k)) return true;
+  return false;
+}
+function step(dt) {
+  const fw = Math.max(-1, Math.min(1, (KY.KeyW ? 1 : 0) - (KY.KeyS ? 1 : 0) + JZ)), st = Math.max(-1, Math.min(1, (KY.KeyD ? 1 : 0) - (KY.KeyA ? 1 : 0) + JX));
+  let dx = fw * -Math.sin(yaw) + st * Math.cos(yaw), dz = fw * -Math.cos(yaw) - st * Math.sin(yaw);
+  const L = Math.hypot(dx, dz) || 1; dx /= L; dz /= L;
+  const sp = ((KY.ShiftLeft || RUN) && FD >= 30 && WT > 0) ? 6.5 : 4.3, moving = fw || st ? 1 : 0;
+  const ax = P.x + dx * sp * dt * moving, az = P.z + dz * sp * dt * moving;
+  if (!col(ax, P.y, P.z)) P.x = ax;
+  if (!col(P.x, P.y, az)) P.z = az;
+  if (KY.Space && gr) vy = 8.5;
+  if (onLadder()) vy = ((fw > .3 || KY.Space) ? 3.2 : 0) - (fw < -.3 ? 3.2 : 0); else vy -= 26 * dt;
+  if (!col(P.x, P.y + vy * dt, P.z)) { P.y += vy * dt; gr = 0; } else { if (vy < 0) gr = 1; vy = 0; }
+}
+
+// Луч от камеры: первый твёрдый блок и последний воздух перед ним
+function ray() {
+  const o = cam.position, d = new THREE.Vector3(); cam.getWorldDirection(d);
+  let pv = null;
+  for (let t = 0; t < 6; t += .05) {
+    const x = Math.round(o.x + d.x * t), y = Math.round(o.y + d.y * t), z = Math.round(o.z + d.z * t);
+    if (pv && pv[0] === x && pv[1] === y && pv[2] === z) continue;
+    if (solid(x, y, z)) return { hit: [x, y, z], pl: pv };
+    pv = [x, y, z];
+  }
+  return null;
+}
+function markDirty(x, z) {
+  const [cx, cz] = chunkOf(x, z);
+  for (const [a, b] of [[0, 0], [1, 0], [-1, 0], [0, 1], [0, -1]]) DIRTY.add((cx + a) + ',' + (cz + b));
+}
+const HOT = new Array(36).fill(null);
+HOT[0] = { id: 'pick', n: 1 }; HOT[1] = { id: 'axe', n: 1 };
+let SLOT = 0, MSG = '', MT = 0;
+const ITEM_NAME = { pick: 'Кирка', axe: 'Кремневый топор', dirt: 'Земля', stone: 'Камень', white: 'Белый камень', kremen: 'Кремень', planks: 'Доски', log: 'Бревно', pork: 'Сырая свинина', chicken: 'Сырая курятина', steak: 'Сырой стейк', stick: 'Палка', furnace: 'Печка', cpork: 'Жареная свинина', cchicken: 'Жареная курятина', csteak: 'Стейк', cauldron: 'Котел', cauldronW: 'Котел с водой', gold: 'Золото', diamond: 'Алмаз', silver: 'Серебро', titan: 'Титан', takurit: 'Такурит' };
+const PLACEABLE = ['dirt', 'stone', 'white', 'planks', 'log'];
+const BLOCK_INFO = { grass: { need: '', drop: 'dirt' }, dirt: { need: '', drop: 'dirt' }, stone: { need: 'pick', drop: 'stone' }, white: { need: 'pick', drop: 'white' }, kremen: { need: 'pick', drop: 'kremen' }, planks: { need: 'axe', drop: 'planks' }, log: { need: 'axe', drop: 'log' }, leaves: { need: '', drop: 'stick' }, furnace: { need: 'pick', drop: 'furnace' }, cauldron: { need: 'pick', drop: 'cauldron' }, gold: { need: 'pick', drop: 'gold' }, diamond: { need: 'pick', drop: 'diamond' }, silver: { need: 'pick', drop: 'silver' }, titan: { need: 'pick', drop: 'titan' }, takurit: { need: 'pick', drop: 'takurit' }, ladder: { need: '', drop: 'ladder' }, bin: { need: '', drop: 'bin' } };
+const TOOL_IDS = ['pick', 'axe', 'dpick', 'spick', 'gpick', 'tpick', 'kpick', 'car', 'bin'];
+// Кирки: крафт 2 палки + 3 материала; ускорение ломания камня, белого камня и руд
+const PICK_MAT = { dpick: 'diamond', spick: 'silver', gpick: 'gold', tpick: 'titan', kpick: 'takurit' };
+const PICK_BONUS = { pick: 0, dpick: .2, spick: .35, gpick: .45, tpick: .6, kpick: .85 };
+const PICK_HEADN = { pick: 0x9a9a9a, dpick: 0x7ef0ff, spick: 0xd8dde4, gpick: 0xf0c040, tpick: 0xc8d0d8, kpick: 0xb07aff };
+const STONEISH = ['stone', 'white', 'kremen', 'diamond', 'silver', 'gold', 'titan', 'takurit'];
+Object.assign(ITEM_NAME, { dpick: 'Алмазная кирка', spick: 'Серебряная кирка', gpick: 'Золотая кирка', tpick: 'Титановая кирка', kpick: 'Такуритовая кирка' });
+Object.assign(ITEM_NAME, { ladder: 'Лестница', metal: 'Металл', car: 'Машина NVM-3000', bin: 'Мусорный бак' });
+let PKH = '';
+function isPick(id) { return PICK_BONUS[id] !== undefined; }
+function needOk(need) { const hd = held(); return need === 'pick' ? isPick(hd) : hd === need; }
+function pkCount(id) { return HOT.reduce((a, s) => a + (s && s.id === id ? s.n : 0), 0); }
+function pkSpend(id, n) { for (let i = 0; i < HOT.length && n > 0; i++) { const s = HOT[i]; if (s && s.id === id) { const a = Math.min(s.n, n); s.n -= a; n -= a; if (s.n <= 0) HOT[i] = null; } } }
+function craftPick(id) {
+  const mat = PICK_MAT[id];
+  if (pkCount('stick') < 2 || pkCount(mat) < 3) return msg('Для ' + ITEM_NAME[id] + ' нужно 2 палки и 3 ' + ITEM_NAME[mat]);
+  if (HOT.every(s => s)) return msg('Нет места для кирки');
+  pkSpend('stick', 2); pkSpend(mat, 3); giveItem(id);
+  msg('Крафт: ' + ITEM_NAME[id]);
+}
+function msg(t) { MSG = t; MT = 2.5; }
+function held() { return HOT[SLOT] ? HOT[SLOT].id : ''; }
+function giveItem(id, n = 1) {
+  const max = TOOL_IDS.includes(id) ? 1 : 64;
+  for (const s of HOT) if (s && s.id === id && s.n < max) { const a = Math.min(max - s.n, n); s.n += a; n -= a; if (!n) return true; }
+  for (let i = 0; i < HOT.length && n > 0; i++) if (!HOT[i]) { const a = Math.min(max, n); HOT[i] = { id, n: a }; n -= a; }
+  return n === 0;
+}
+function takeSel() { const s = HOT[SLOT]; if (s && --s.n <= 0) HOT[SLOT] = null; }
+function craftPlanks() {
+  const li = HOT.findIndex(s => s && s.id === 'log');
+  if (li < 0) return msg('Нужно бревно в хотбаре');
+  if (--HOT[li].n <= 0) HOT[li] = null;
+  msg(giveItem('planks', 4) ? '+4 доски' : 'Нет места для досок');
+}
+function hotText() { return HOT.map((s, i) => (i === SLOT ? '▶' : ' ') + (i + 1) + ' ' + (s ? ITEM_NAME[s.id] + ' ' + s.n : '—')).join('\n'); }
+function doBreak() {
+  if (attackAni()) return;
+  const r = ray(); if (!r) return;
+  const [x, y, z] = r.hit, t = getB(x, y, z), info = BLOCK_INFO[t];
+  if (!info) return msg('Этот блок не ломается');
+  if (info.need && !needOk(info.need)) return msg('Нужен инструмент: ' + ITEM_NAME[info.need]);
+  setB(x, y, z, ''); markDirty(x, z);
+  if (t === 'furnace') breakFurnace(x, y, z);
+  snd('hit'); if (t === 'log') treeCut(x, z);
+  if (t === 'bin') takeBin(x, y, z); else if (info.drop && !giveItem(info.drop)) msg('Инвентарь полон');
+}
+function doPlace() {
+  if (carInteract()) return;
+  if (binInteract()) return;
+  if (useHeld()) return;
+  const r = ray(); if (r && r.hit && getB(r.hit[0], r.hit[1], r.hit[2]) === 'furnace') return furnaceUse(r.hit);
+    if (r && r.pl && HOT[SLOT] && (HOT[SLOT].id === 'ladder' || HOT[SLOT].id === 'bin')) {
+    const [x, y, z] = r.pl;
+    if (getB(x, y, z) || (Math.abs(x - P.x) < .8 && Math.abs(z - P.z) < .8 && y + .5 > P.y && y - .5 < P.y + 1.8)) return msg('Нет места');
+    const it = HOT[SLOT], id = it.id; setB(x, y, z, id); if (id === 'bin') placeBin(x, y, z, it.bc); markDirty(x, z); takeSel(); return;
+  }
+  if (r && r.pl && HOT[SLOT] && HOT[SLOT].id === 'furnace') return placeFurnace(r.pl);
+  if (!r || !r.pl) return;
+  const h = HOT[SLOT];
+  if (!h || !PLACEABLE.includes(h.id)) return msg('Выбери блок в хотбаре (1–9)');
+  const [x, y, z] = r.pl;
+  const onPlayer = Math.abs(x - P.x) < .8 && Math.abs(z - P.z) < .8 && y + .5 > P.y && y - .5 < P.y + 1.8;
+  if (getB(x, y, z) || onPlayer) return;
+  setB(x, y, z, h.id); markDirty(x, z); takeSel(); snd('place');
+}
+
+// Меш чанка: грани, которые видны (соседний блок пустой или вода), по два типа материала
+function mkMesh(pos, colr, water) {
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setAttribute('color', new THREE.Float32BufferAttribute(colr, 3));
+  const m = new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide, transparent: water, opacity: water ? .7 : 1 });
+  return new THREE.Mesh(g, m);
+}
+function buildChunk(cx, cz) {
+  const key = cx + ',' + cz;
+  if (MESH.has(key)) dropChunk(key);
+  const sp = [], scol = [], wp = [], wcol = [];
+  for (let x = cx * CS; x < cx * CS + CS; x++)
+    for (let z = cz * CS; z < cz * CS + CS; z++) {
+      const c = colInfo(x, z); if (!c) continue;
+      for (let y = 7; y >= -c.dp; y--) {
+        const t = getB(x, y, z); if (!t) continue;
+        const wat = t === 'water', PP = wat ? wp : sp, CC = wat ? wcol : scol;
+        for (const [ax, s] of FACE_DEFS) {
+          const nt = getB(x + (ax === 0 ? s : 0), y + (ax === 1 ? s : 0), z + (ax === 2 ? s : 0));
+          if (nt && (nt !== 'water' || wat)) continue;
+          let cc = TCOL[t] || 0xff00ff;
+          if (t === 'grass' && !(ax === 1 && s === 1)) cc = TCOL.dirt;
+          const r = (cc >> 16 & 255) / 255, g = (cc >> 8 & 255) / 255, b = (cc & 255) / 255;
+          const sh = ax === 1 ? (s > 0 ? 1 : .6) : ax === 0 ? .8 : .7;
+          for (const i of QI) {
+            const [u, v] = QC[i], p = [0, 0, 0];
+            p[ax] = s * .5; p[(ax + 1) % 3] = u; p[(ax + 2) % 3] = v;
+            PP.push(x + p[0], y + p[1], z + p[2]);
+            CC.push(r * sh, g * sh, b * sh);
+          }
+        }
+      }
+    }
+  const grp = new THREE.Group();
+  if (sp.length) grp.add(mkMesh(sp, scol, false));
+  if (wp.length) grp.add(mkMesh(wp, wcol, true));
+  sc.add(grp); MESH.set(key, grp);
+}
+function dropChunk(k) {
+  const g = MESH.get(k); if (!g) return;
+  sc.remove(g);
+  g.traverse(o => { if (o.geometry) o.geometry.dispose(); if (o.material) o.material.dispose(); });
+  MESH.delete(k);
+}
+
+// Ввод
+addEventListener('keydown', e => {
+  if (e.target && e.target.tagName === 'INPUT') return;
+  if (e.code === 'KeyE' && CUR) return INVO.style.display === 'block' ? closeCraft() : openCraft();
+  if (e.code === 'Escape' && ADMO.style.display === 'block') return closeAdmin();
+  if (e.code === 'Escape' && INVO.style.display === 'block') return closeCraft();
+  if (e.code === 'Escape') return CUR ? (PAUSED ? closePause() : openPause()) : null;
+  KY[e.code] = 1;
+  if (e.code === 'BracketRight') DIST = Math.min(6, DIST + 1);
+  if (e.code === 'BracketLeft') DIST = Math.max(1, DIST - 1);
+  const n = +e.code.replace('Digit', '');
+  if (n >= 1 && n <= 9) SLOT = n - 1;
+  if (e.code === 'KeyC') craftPlanks();
+  if (e.code === 'KeyF') craftFurnace();
+  if (e.code === 'KeyK') craftCauldron();
+});
+addEventListener('keyup', e => { delete KY[e.code]; });
+addEventListener('mousemove', e => {
+  if (document.pointerLockElement === ren.domElement) {
+    yaw -= e.movementX * .002;
+    pit = Math.max(-1.5, Math.min(1.5, pit - e.movementY * .002));
+  }
+});
+ren.domElement.onclick = () => ren.domElement.requestPointerLock();
+addEventListener('mousedown', e => {
+  if (document.pointerLockElement !== ren.domElement) return;
+  if (e.button === 0 && !attackAni()) BRK = true;
+  if (e.button === 2) doPlace();
+});
+addEventListener('contextmenu', e => e.preventDefault());
+
+// Цикл: физика, прогрузка чанков, пересборка изменённых, отрисовка
+let last = performance.now();
+const HUD = document.getElementById('hud');
+function frame(now) {
+  let dt = Math.min((now - last) / 1000, .05); last = now; if (PAUSED) dt = 0;
+  if (CUR && !SEAT) { if (!tornPlayer(dt)) step(dt); flight(dt, P); if (Math.hypot(P.x, P.z) > 72 || P.y < -30) { P.x = 0; P.z = 0; P.y = 3; vy = 0; P.tvx = 0; P.tvz = 0; P.tt = null; msg('Тебя выкинуло за карту, телепорт в центр'); } }
+  if (CUR && SEAT) carTick(dt);
+  carRender(dt); carPickUI();
+  const r = updateChunks(P.x, P.z, DIST);
+  for (const k of r.removed) dropChunk(k);
+  for (const [cx, cz] of r.added) buildChunk(cx, cz);
+  let n = 0;
+  for (const k of [...DIRTY]) {
+    if (n >= 4) break;
+    DIRTY.delete(k); n++;
+    if (CHUNKS.has(k)) { const [a, b] = k.split(',').map(Number); buildChunk(a, b); }
+  }
+  if (MT > 0) MT -= dt;
+  treeTick(dt);
+  updAnimals(dt);
+  updFurnace(dt);
+  furLabel();
+  updSurvival(dt);
+  if (CUR) { try { updDis(dt); } catch (err) { msg('Ошибка стихии: ' + err.message); } }
+  updHand(dt);
+  drawHot();
+  cam.position.set(P.x, P.y + 1.6, P.z);
+  cam.rotation.set(pit, yaw, 0, 'YXZ');
+  if (!CUR) menuCam(dt);
+  HUD.textContent = `Чанков прогружено: ${CHUNKS.size} (радиус ${DIST})   изменений: ${MODS.size}\n[ и ] — дальность прогрузки\nЛКМ ломать · ПКМ ставить (${SEL})\n1–9 слот · C доски · ${MT > 0 ? MSG : ' '}`;
+  ren.render(sc, cam);
+  requestAnimationFrame(frame);
+}
+/* Телефон: джойстик слева, обзор свайпом справа, кнопки справа */
+const IS_TOUCH = matchMedia('(pointer:coarse)').matches;
+let JX = 0, JZ = 0, jid = null, jc = [0, 0], lid = null, lx = 0, ly = 0;
+const JOY = document.createElement('div');
+JOY.style.cssText = 'position:fixed;left:18px;bottom:64px;width:120px;height:120px;border-radius:50%;background:rgba(255,255,255,.12);border:2px solid rgba(255,255,255,.3);display:none';
+const KNOB = document.createElement('div');
+KNOB.style.cssText = 'position:absolute;left:32px;top:32px;width:56px;height:56px;border-radius:50%;background:rgba(255,255,255,.35)';
+JOY.appendChild(KNOB); document.body.appendChild(JOY);
+function tbtn(label, pos, fn) {
+  const b = document.createElement('button');
+  b.className = 'tb'; b.textContent = label;
+  b.style.cssText = 'position:fixed;width:56px;height:56px;' + pos + ';border-radius:50%;background:rgba(0,0,0,.45);border:2px solid rgba(255,255,255,.4);color:#fff;font-size:12px;white-space:pre-line;text-align:center;line-height:1.2;display:flex;flex-direction:column;align-items:center;justify-content:center;box-sizing:border-box;user-select:none';
+  b.onpointerdown = e => { e.preventDefault(); fn(); };
+  document.body.appendChild(b);
+}
+function jmove(t) {
+  let x = (t.clientX - jc[0]) / 60, y = (t.clientY - jc[1]) / 60;
+  const m = Math.hypot(x, y); if (m > 1) { x /= m; y /= m; } if (m < .12) { x = 0; y = 0; }
+  JX = x; JZ = -y; KNOB.style.transform = `translate(${x * 40}px,${y * 40}px)`;
+}
+function tStart(e) {
+  if (INVO.style.display === 'block' || ADMO.style.display === 'block') return;
+  if (e.target.closest && e.target.closest('button,input')) return;
+  if (!IS_TOUCH) return;
+  for (const t of e.changedTouches) {
+    if (t.target.closest && t.target.closest('.tb')) continue;
+    if (!(t.target && t.target.closest && t.target.closest('button')) && jid === null && t.clientX < innerWidth * .45 && t.clientY > innerHeight * .4) {
+      jid = t.identifier; const r = JOY.getBoundingClientRect(); jc = [r.left + r.width / 2, r.top + r.height / 2]; jmove(t);
+    } else if (lid === null && !(t.target && t.target.closest && t.target.closest('button'))) { lid = t.identifier; lx = t.clientX; ly = t.clientY; }
+  }
+  e.preventDefault();
+}
+function tMove(e) {
+  if (INVO.style.display === 'block' || ADMO.style.display === 'block') return;
+  if (!IS_TOUCH) return;
+  for (const t of e.changedTouches) {
+    if (t.identifier === jid) jmove(t);
+    else if (t.identifier === lid) { yaw -= (t.clientX - lx) * .006; pit = Math.max(-1.5, Math.min(1.5, pit - (t.clientY - ly) * .006)); lx = t.clientX; ly = t.clientY; }
+  }
+  e.preventDefault();
+}
+function tEnd(e) {
+  for (const t of e.changedTouches) {
+    if (t.identifier === jid) { jid = null; JX = 0; JZ = 0; KNOB.style.transform = ''; }
+    if (t.identifier === lid) lid = null;
+  }
+}
+addEventListener('touchstart', tStart, { passive: false });
+addEventListener('touchmove', tMove, { passive: false });
+addEventListener('touchend', tEnd);
+addEventListener('touchcancel', tEnd);
+if (IS_TOUCH) {
+  JOY.style.display = 'block';
+  tbtn('⛏\nЛомать', 'right:24px;bottom:70px;width:72px;height:72px', () => { if (!attackAni()) BRK = true; });
+  tbtn('Взаим.', 'right:116px;bottom:70px', doPlace);
+  tbtn('⤒\nПрыжок', 'right:24px;bottom:160px', () => { if (gr) vy = 8.5; });
+  tbtn('Бег', 'right:100px;bottom:160px', () => { RUN = !RUN; msg(RUN ? 'Бег включён' : 'Бег выключен'); });
+  tbtn('Инв.', 'right:12px;top:8px;width:44px;height:44px', openCraft);
+  tbtn('⛶', 'right:62px;top:8px;width:44px;height:44px', fsToggle);
+  tbtn('Пауза', 'right:112px;top:8px;width:44px;height:44px', openPause);
+}
+/* Видимый хотбар сверху по центру: тап по слоту выбирает его */
+const HBSZ = matchMedia('(pointer:coarse)').matches ? 36 : 52;
+const HB = document.createElement('div');
+HB.style.cssText = 'position:fixed;bottom:14px;left:50%;transform:translateX(-50%);display:flex;gap:4px;z-index:5';
+const HBS = [];
+for (let i = 0; i < 9; i++) {
+  const d = document.createElement('div');
+  d.style.cssText = 'width:' + HBSZ + 'px;height:' + HBSZ + 'px;border-radius:6px;background:rgba(0,0,0,.55);border:2px solid #333;color:#fff;font-size:11px;display:flex;flex-direction:column;align-items:center;justify-content:center;pointer-events:auto;user-select:none;overflow:hidden';
+  d.onpointerdown = e => { e.preventDefault(); SLOT = i; drawHot(); };
+  HB.appendChild(d); HBS.push(d);
+}
+document.body.appendChild(HB);
+function drawHot() {
+  HBS.forEach((d, i) => {
+    const s = HOT[i];
+    d.style.borderColor = i === SLOT ? '#ffd54a' : '#333';
+    d.style.position = 'relative';
+    d.innerHTML = '<span style="opacity:.6">' + (i + 1) + '</span>' + (s ? '<span>' + (ITEM_NAME[s.id] || '').slice(0, 6) + '</span><b>' + s.n + '</b>' : '');
+  });
+}
+drawHot();
+/* Животные: появляются во время игры рядом с игроком, бродят по острову, дают сырое мясо */
+const ANIMALS = [];
+let SPAWN_T = 3;
+const AKIND = {
+  pig: { hp: 10, drop: 'pork', n: 3, sp: .9, body: [.8, .55, .5, 0xf2a0b0], head: .42, leg: 0x3a2a2a },
+  chicken: { hp: 3, drop: 'chicken', n: 1, sp: 1.4, body: [.36, .32, .45, 0xf5f5f5], head: .24, leg: 0xe0a030 },
+  cow: { hp: 7, drop: 'steak', n: 8, sp: .8, body: [1, .75, .5, 0xf0f0f0], head: .5, leg: 0x2a2a2a }
+};
+// Земля под животным: ищем сверху вниз, но не выше 1, чтобы не встать на листву
+function groundY(x, z) {
+  const X = Math.round(x), Z = Math.round(z);
+  for (let y = 1; y >= -3; y--) if (solid(X, y, Z)) return y + .5;
+  return .5;
+}
+function animalModel(k) {
+  const A = AKIND[k], [w, h, d, c] = A.body, g = new THREE.Group(), lh = k === 'chicken' ? .2 : .35;
+  const put = (m, x, y, z) => { m.position.set(x, y, z); g.add(m); };
+  const M = col => new THREE.MeshLambertMaterial({ color: col });
+  put(new THREE.Mesh(new THREE.BoxGeometry(w, h, d), M(c)), 0, lh + h / 2, 0);
+  put(new THREE.Mesh(new THREE.BoxGeometry(A.head, A.head, A.head), M(c)), 0, lh + h * .8, d / 2 + A.head * .4);
+  for (const ex of [-1, 1]) put(new THREE.Mesh(new THREE.BoxGeometry(.06, .06, .04), M(0x111111)), ex * A.head * .25, lh + h * .8 + A.head * .15, d / 2 + A.head * .9);
+  for (const sx of [-1, 1]) for (const sz of [-1, 1]) put(new THREE.Mesh(new THREE.BoxGeometry(.12, lh, .12), M(A.leg)), sx * w * .35, lh / 2, sz * d * .35);
+  g.traverse(o => { if (o.isMesh) o.castShadow = true; });
+  g.scale.set(1.5, 1.5, 1.5);
+  sc.add(g);
+  return g;
+}
+function spawnAnimal(k, x, z) {
+  ANIMALS.push({ k, g: animalModel(k), x, y: groundY(x, z), z, h: null, t: 1, hurt: 0, hp: AKIND[k].hp });
+}
+// Новое животное появляется на траве в 14–34 блоках от игрока, не на воде и не за краем острова
+function trySpawn() {
+  if (ANIMALS.length >= 12) return;
+  const a = Math.random() * Math.PI * 2, d = 14 + Math.random() * 20;
+  const x = P.x + Math.cos(a) * d, z = P.z + Math.sin(a) * d;
+  const c = colInfo(Math.round(x), Math.round(z));
+  if (!c || c.w || Math.hypot(x, z) > RI - 4 || !CHUNKS.has(chunkOf(x, z).join(','))) return;
+  const y = groundY(x, z);
+  if (getB(Math.round(x), Math.round(y - .5), Math.round(z)) !== 'grass') return;
+  const ks = Object.keys(AKIND);
+  spawnAnimal(ks[Math.floor(Math.random() * ks.length)], x, z);
+}
+function updAnimals(dt) {
+  if (!MP.ws && (SPAWN_T -= dt) <= 0) { SPAWN_T = 8; trySpawn(); }
+  for (let i = ANIMALS.length - 1; i >= 0; i--) {
+    const a = ANIMALS[i], A = AKIND[a.k];
+    if (Math.hypot(a.x - P.x, a.z - P.z) > 70) { sc.remove(a.g); ANIMALS.splice(i, 1); continue; }
+    a.hurt = Math.max(0, a.hurt - dt);
+    a.g.rotation.z = a.hurt > 0 ? Math.sin(a.hurt * 50) * .25 : 0;
+    if ((a.t -= dt) <= 0) { a.t = 1.5 + Math.random() * 2.5; a.h = Math.random() < .35 ? null : Math.random() * Math.PI * 2; }
+    if (a.h !== null) {
+      const nx = a.x + Math.sin(a.h) * A.sp * dt, nz = a.z + Math.cos(a.h) * A.sp * dt;
+      const c = colInfo(Math.round(nx), Math.round(nz));
+      if (!c || c.w || solid(Math.round(nx), Math.round(a.y + .5), Math.round(nz))) a.h = Math.random() * Math.PI * 2;
+      else { a.x = nx; a.z = nz; a.g.rotation.y = a.h; }
+    }
+    a.y += (groundY(a.x, a.z) - a.y) * Math.min(1, dt * 8);
+    a.g.position.set(a.x, a.y, a.z);
+    a.g.visible = Math.hypot(a.x - P.x, a.z - P.z) < 40 && CHUNKS.has(chunkOf(a.x, a.z).join(','));
+  }
+}
+// Удар по животному, которое стоит прямо перед прицелом. Возвращает true, если удар был
+function attackAni() {
+  if (MP.ws) return mpAttack();
+  const d = new THREE.Vector3(); cam.getWorldDirection(d);
+  let best = null, bt = 3.2;
+  for (const a of ANIMALS) {
+    const vx = a.x - cam.position.x, vy = a.y + .6 - cam.position.y, vz = a.z - cam.position.z;
+    const t = vx * d.x + vy * d.y + vz * d.z;
+    if (t < 0 || t > bt) continue;
+    if (Math.hypot(vx - d.x * t, vy - d.y * t, vz - d.z * t) < .8) { bt = t; best = a; }
+  }
+  if (!best) return false;
+  const h = HOT[SLOT], dmg = !h ? 1 : (isPick(h.id) || h.id === 'axe') ? 2 : 1;
+  snd(best.k); best.hp -= dmg; best.hurt = .35;
+  if (best.hp > 0) { msg('Удар! Осталось ' + best.hp); return true; }
+  ANIMALS.splice(ANIMALS.indexOf(best), 1); sc.remove(best.g);
+  const A = AKIND[best.k];
+  msg(giveItem(A.drop, A.n) ? '+' + A.n + ' ' + ITEM_NAME[A.drop] : 'Инвентарь полон');
+  return true;
+}
+/* Печка 2x2: дрова вниз (до 25, каждое горит 30 с), мясо вверх (порция каждые 10 с), зажигание мини-игрой */
+const FURN = new Map(), COOKS = { pork: 'cpork', chicken: 'cchicken', steak: 'csteak' };
+let FK = null, FSEL = null, FIRE_F = null, FIRE_N = 0, FIRE_T = 0;
+const FLAME = new THREE.Mesh(new THREE.ConeGeometry(.22, .6, 6), new THREE.MeshBasicMaterial({ color: 0xff7a1a }));
+FLAME.visible = false; sc.add(FLAME);
+const FI = document.createElement('div');
+FI.style.cssText = 'position:fixed;left:50%;top:calc(50% + 30px);transform:translateX(-50%);background:rgba(0,0,0,.6);padding:4px 10px;border-radius:6px;font-size:13px;display:none;white-space:nowrap;pointer-events:none';
+document.body.appendChild(FI);
+const FOODO = document.createElement('div');
+FOODO.style.cssText = 'position:fixed;inset:0;display:none;background:rgba(0,0,0,.75);z-index:20;align-items:center;justify-content:center;flex-direction:column;color:#fff;font-size:15px;text-align:center';
+FOODO.style.overflow = 'auto';
+document.body.appendChild(FOODO);
+const FIREO = document.createElement('div');
+FIREO.style.cssText = 'position:fixed;inset:0;display:none;background:rgba(0,0,0,.75);z-index:21;align-items:center;justify-content:center;flex-direction:column;color:#fff;font-size:18px;text-align:center';
+FIREO.innerHTML = '<h2>Разжигание!</h2><p>Тапай по экрану: 80 раз за 20 секунд</p><div id="fcnt" style="font-size:40px;font-weight:700">0 / 80</div><div id="ftm" style="font-size:22px">20 с</div>';
+document.body.appendChild(FIREO);
+FIREO.onpointerdown = () => {
+  if (!FIRE_F) return;
+  FIRE_N++; snd('tap'); document.getElementById('fcnt').textContent = FIRE_N + ' / 80';
+  if (FIRE_N >= 80) endFire(true);
+};
+FOODO.onclick = e => {
+  const b = e.target.closest('button'); if (!b || !FSEL) return;
+  const f = FSEL;
+  if (b.dataset.k) { FK = b.dataset.k; return msg('Выбрано: ' + ITEM_NAME[FK]); }
+  if (b.dataset.put) {
+    if (!FK) return msg('Сначала выбери мясо');
+    if (f.fn && f.ft !== FK) return msg('В печке уже другое мясо');
+    const room = 64 - f.fn - f.done;
+    if (room <= 0) return msg('Печка полна (64)');
+    const q = Math.max(1, Math.min(+document.getElementById('fqty').value || 1, cntItem(FK), room));
+    if (cntItem(FK) < 1) return msg('Нет такого мяса');
+    takeItem(FK, q); f.fn += q; f.ft = FK; furnSync(f); msg('Положено: ' + q); return drawFood();
+  }
+  if (b.dataset.take) {
+    if (giveItem(COOKS[f.ft], f.done)) { f.done = 0; if (!f.fn) f.ft = ''; furnSync(f); msg('Забрано'); } else msg('Нет места в хотбаре');
+    return drawFood();
+  }
+  if (b.dataset.close) FOODO.style.display = 'none';
+};
+function cntItem(id) { return HOT.reduce((a, s) => a + (s && s.id === id ? s.n : 0), 0); }
+function takeItem(id, n) {
+  for (let i = 0; i < HOT.length && n > 0; i++) { const s = HOT[i]; if (s && s.id === id) { const a = Math.min(s.n, n); s.n -= a; n -= a; if (s.n <= 0) HOT[i] = null; } }
+}
+function baseOf(x, y, z) {
+  for (const [a, b] of [[0, 0], [-1, 0], [0, -1], [-1, -1]]) { const f = FURN.get((x + a) + ',' + (y + b) + ',' + z); if (f) return f; }
+  return null;
+}
+function placeFurnace([x, y, z]) {
+  const cells = [[x, y], [x + 1, y], [x, y + 1], [x + 1, y + 1]];
+  for (const [a, b] of cells) if (getB(a, b, z) || (Math.abs(a - P.x) < .8 && Math.abs(z - P.z) < .8 && b + .5 > P.y && b - .5 < P.y + 1.8)) return msg('Нет места для печки');
+  const nf = { x, y, z, fuel: 0, burn: 0, lit: 0, fn: 0, ft: '', done: 0, cp: 0 }; FURN.set(x + ',' + y + ',' + z, nf); furnSync(nf);
+  for (const [a, b] of cells) { setB(a, b, z, 'furnace'); markDirty(a, z); }
+  takeSel();
+}
+function mpSendFst(k, st) { if (MP.ws && MP.ws.readyState === 1) MP.ws.send(JSON.stringify({ t: 'fst', k, s: st })); }
+function furnSync(f) { mpSendFst(f.x + ',' + f.y + ',' + f.z, f); }
+function furnDrop(k) { mpSendFst(k, null); }
+function caulSync(k) { if (MP.ws && MP.ws.readyState === 1) MP.ws.send(JSON.stringify({ t: 'cst', k, v: CAUL.get(k) || 0 })); }
+function breakFurnace(x, y, z) {
+  const f = baseOf(x, y, z); if (!f) return;
+  FURN.delete(f.x + ',' + f.y + ',' + f.z); furnDrop(f.x + ',' + f.y + ',' + f.z);
+  for (let a = 0; a <= 1; a++) for (let b = 0; b <= 1; b++) { setB(f.x + a, f.y + b, f.z, ''); markDirty(f.x + a, f.z); }
+}
+function craftFurnace() {
+  if (cntItem('stone') < 8) return msg('Нужно 8 камня в хотбаре');
+  takeItem('stone', 8);
+  msg(giveItem('furnace') ? 'Печка создана' : 'Нет места в хотбаре');
+}
+function furnaceUse(hit) {
+  const f = baseOf(hit[0], hit[1], hit[2]); if (!f) return;
+  if (hit[1] > f.y) return openFood(f);
+  const h = HOT[SLOT], id = h ? h.id : '';
+  if (id === 'log') {
+    if (f.fuel >= 25) return msg('Печка полна дров (25)');
+    const n = Math.min(cntItem('log'), 25 - f.fuel);
+    if (n <= 0) return msg('Нет бревна в хотбаре');
+    takeItem('log', n); f.fuel += n; furnSync(f); msg('Дрова: ' + f.fuel + '/25');
+  } else if (id === 'kremen') {
+    if (f.lit) return msg('Печка уже горит');
+    if (f.fuel <= 0) return msg('Сначала положи дрова');
+    if (!cntItem('stick')) return msg('Нужна палка в хотбаре');
+    startFire(f);
+  } else msg('Дрова — бревном, поджигание — кремнем');
+}
+function openFood(f) { FSEL = f; if (document.pointerLockElement) document.exitPointerLock(); FOODO.style.display = 'flex'; drawFood(); }
+function drawFood() {
+  const f = FSEL, ks = ['pork', 'chicken', 'steak'].filter(k => cntItem(k) > 0);
+  FOODO.innerHTML = '<h3 style="margin:0">Печка: положить мясо</h3>' +
+    '<div style="margin:8px">' + (ks.map(k => `<button data-k='${k}'>${ITEM_NAME[k]} ×${cntItem(k)}</button>`).join(' ') || 'Нет сырого мяса в хотбаре') + '</div>' +
+    `<p>В печке: ${f.fn ? ITEM_NAME[f.ft] + ' ×' + f.fn : 'пусто'} · готово: ${f.done}</p>` +
+    (f.done ? `<button data-take='1'>Забрать ${ITEM_NAME[COOKS[f.ft]]} ×${f.done}</button> ` : '') +
+    `<p><input id='fqty' type='number' min='1' value='1' style='width:80px;font-size:18px'> <button data-put='1'>Положить</button> <button data-close='1'>Закрыть</button></p>`;
+}
+function startFire(f) {
+  FIRE_F = f; FIRE_N = 0; FIRE_T = 20;
+  if (document.pointerLockElement) document.exitPointerLock();
+  document.getElementById('fcnt').textContent = '0 / 80';
+  FIREO.style.display = 'flex';
+}
+function endFire(ok) {
+  const f = FIRE_F; FIRE_F = null; FIREO.style.display = 'none';
+  if (ok) { f.lit = 1; f.burn = 30; f.fuel--; furnSync(f); snd('ignite'); msg('Печка загорелась!'); } else msg('Не успел — попробуй ещё раз');
+}
+function updFurnace(dt) {
+  let on = null;
+  for (const f of FURN.values()) {
+    if (f.lit && (f.burn -= dt) <= 0) { if (f.fuel > 0) { f.fuel--; f.burn = 30; } else { f.lit = 0; f.burn = 0; } }
+    if (f.lit) {
+      on = f;
+      if (f.fn > 0 && (f.cp = (f.cp || 0) + dt) >= 10) { f.cp -= 10; f.fn--; f.done++; msg('Готово: ' + ITEM_NAME[COOKS[f.ft]] + ' ×' + f.done); }
+    }
+  }
+  FLAME.visible = !!on;
+  if (on) FLAME.position.set(on.x + .5, on.y + .5, on.z - .6);
+  if (FIRE_F) {
+    FIRE_T -= dt;
+    document.getElementById('ftm').textContent = Math.ceil(Math.max(0, FIRE_T)) + ' с';
+    if (FIRE_T <= 0) endFire(false);
+  }
+}
+function furLabel() {
+  const r = ray(), f = r && r.hit && getB(r.hit[0], r.hit[1], r.hit[2]) === 'furnace' ? baseOf(r.hit[0], r.hit[1], r.hit[2]) : null;
+  if (!f) { FI.style.display = 'none'; return; }
+  FI.style.display = 'block';
+  FI.textContent = (r.hit[1] > f.y ? 'Верх: еда' : 'Низ: дрова') + ' · дров ' + f.fuel + '/25' + (f.lit ? ' · горит ' + Math.ceil(f.burn) + ' с' : ' · не горит') + ' · сырых ' + f.fn + ', готовых ' + f.done;
+}
+/* Полоски здоровья, еды и воды. Правила из первой версии: еда тратится от ходьбы, вода ускоряет/замедляет */
+let HP = 100, FD = 100, WT = 50, RUN = false;
+const EATV = { cpork: 30, cchicken: 25, csteak: 40 };
+const CAUL = new Map();   // 'x,y,z' -> процент воды в котле
+const sty = document.createElement('style');
+sty.textContent = '@keyframes vb{0%,100%{opacity:.9}50%{opacity:.2}}';
+document.head.appendChild(sty);
+const barHTML = (name, id, col) => '<div>' + name + '</div><div style="height:12px;background:rgba(0,0,0,.55);border:2px solid #111;border-radius:6px;overflow:hidden;margin:2px 0 8px"><i id="' + id + '" style="display:block;height:100%;width:100%;background:' + col + '"></i></div>';
+const BARS = document.createElement('div');
+BARS.style.cssText = 'position:fixed;left:16px;bottom:96px;width:230px;pointer-events:none;font-size:11px;text-shadow:0 1px 2px #000';
+BARS.innerHTML = barHTML('Здоровье', 'bHP', '#d33') + barHTML('Еда', 'bFD', '#e8902a') + barHTML('Вода', 'bWT', '#3aa0e8');
+BARS.id = 'bars';
+document.body.appendChild(BARS);
+const VIG = document.createElement('div');
+VIG.style.cssText = 'position:fixed;inset:0;pointer-events:none;opacity:0;z-index:3;background:radial-gradient(ellipse at center,transparent 40%,rgba(230,0,0,.9) 100%)';
+document.body.appendChild(VIG);
+function die() { msg('Ты погиб, возрождение'); HP = 100; FD = 100; WT = 50; P.x = 0; P.y = 3; P.z = 0; vy = 0; }
+function updSurvival(dt) {
+  const mv = !!(KY.KeyW || KY.KeyS || KY.KeyA || KY.KeyD) || Math.hypot(JX, JZ) > .15;
+  const sprint = (KY.ShiftLeft || RUN) && mv && FD >= 30 && WT > 0;
+  if (mv && gr && (STEP_T -= dt) <= 0) { STEP_T = sprint ? .3 : .45; snd('step'); }
+  let fr = (mv ? 1 : .25) * (DS && DS.d.ch ? 3 : 1);                 // ходьба 1 в секунду, стоишь в 4 раза медленнее
+  if (WT < 10) fr *= 1.5;                // мало воды: еда тратится быстрее
+  if (WT <= 0) fr *= 1.35;               // воды нет совсем
+  FD = Math.max(0, FD - fr * dt);
+  let wr = (sprint ? .1 : .05) * (DS && DS.d.ch ? 3 : 1);            // бег тратит воду вдвое быстрее
+  if (WT < 10) wr /= 1.5;
+  WT = Math.max(0, WT - wr * dt);
+  if (FD >= 30 && HP < 100) HP = Math.min(100, HP + .5 * dt);   // регенерация только при еде от 30
+  if (FD <= 0) HP -= .5 * dt;
+  if (HP <= 0) die();
+  document.getElementById('bHP').style.width = HP + '%';
+  document.getElementById('bFD').style.width = FD + '%';
+  document.getElementById('bWT').style.width = WT * 2 + '%';
+  if (HP <= 20) { VIG.style.opacity = (20 - HP) / 20 * .8 + .2; VIG.style.animation = HP < 15 ? 'vb .6s infinite' : ''; }
+  else { VIG.style.opacity = 0; VIG.style.animation = ''; }
+}
+// Луч до воды (вода не твёрдая, поэтому обычный луч её пропускает)
+function rayWater() {
+  const o = cam.position, d = new THREE.Vector3(); cam.getWorldDirection(d);
+  for (let t = 0; t < 6; t += .05) {
+    const x = Math.round(o.x + d.x * t), y = Math.round(o.y + d.y * t), z = Math.round(o.z + d.z * t);
+    if (getB(x, y, z) === 'water') return true;
+    if (solid(x, y, z)) return false;
+  }
+  return false;
+}
+// ПКМ с едой, котлом. Возвращает true, если действие уже выполнено
+function useHeld() {
+  const h = HOT[SLOT], r = ray(), hit = r && r.hit ? r.hit : null;
+  if (hit && getB(hit[0], hit[1], hit[2]) === 'cauldron') {
+    const k = hit.join(','), w = CAUL.get(k) || 0;
+    if (w < 10) { msg('Котел пуст'); return true; }
+    CAUL.set(k, w - 10); caulSync(k); WT = Math.min(50, WT + 10); snd('pop');
+    msg('+10 воды · в котле ' + (w - 10) + '%'); return true;
+  }
+  if (!h) return false;
+  if (EATV[h.id]) { FD = Math.min(100, FD + EATV[h.id]); takeSel(); snd('pop'); msg('+' + EATV[h.id] + ' еды'); return true; }
+  if (h.id === 'cauldron' && rayWater()) { HOT[SLOT] = { id: 'cauldronW', n: 1 }; msg('Котел набран водой'); return true; }
+  if ((h.id === 'cauldron' || h.id === 'cauldronW') && r && r.pl) {
+    const [x, y, z] = r.pl;
+    if (getB(x, y, z) || (Math.abs(x - P.x) < .8 && Math.abs(z - P.z) < .8 && y + .5 > P.y && y - .5 < P.y + 1.8)) { msg('Нет места для котла'); return true; }
+    setB(x, y, z, 'cauldron'); markDirty(x, z);
+    const ck = x + ',' + y + ',' + z; CAUL.set(ck, h.id === 'cauldronW' ? 100 : 0); caulSync(ck);
+    takeSel(); return true;
+  }
+  return false;
+}
+function craftCauldron() {
+  if (cntItem('stone') < 5) return msg('Нужно 5 камня в хотбаре');
+  takeItem('stone', 5);
+  msg(giveItem('cauldron') ? 'Котел создан' : 'Нет места в хотбаре');
+}
+/* Стихии: таймер 3–5 минут. Урон только без крыши над головой. Лёгкие 65%, средние 20%, опасные 15% */
+const DIS = {
+  rain: { n: 'Дождь', t: 60, hz: .05, rn: [200, 0, -14], c: 0x6b7a8a },
+  downpour: { n: 'Ливень', t: 60, hz: .1, rn: [450, -2, -22], c: 0x4d5a68 },
+  wind: { n: 'Ветер', t: 60, hz: .1, rn: [300, -16, -4], c: 0x9ab0c0 },
+  tornado1: { n: 'Торнадо', t: 120, hz: .25, tn: 1, kn: 1, rn: [300, -6, -18], c: 0x3c4238, sh: 1.5 },
+  tsunami1: { n: 'Слабое цунами', t: 120, hz: .5, wv: .4, c: 0x5a84a8 },
+  fog: { n: 'Туман', t: 120, hz: 0, fg: 1, c: 0xbdbdbd },
+  tornado2: { n: 'Торнадо (2 кат.)', t: 240, hz: 1, tn: 1, kn: 1, dm: .6, rn: [400, -8, -20], c: 0x2a2f28, sh: 3 },
+  tsunami2: { n: 'Цунами', t: 240, hz: 2.5, wv: 1, c: 0x3a5a78, sh: 1.5 },
+  death: { n: 'Стихийная смерть', t: 240, hz: .8, tz: 5, wz: 12, combo: 1, tv: 1, kn: 1, fg: 1, wv: 1.6, dm: 2.4, rn: [600, -6, -25], c: 0x6a1a2a, sh: 5 },
+  chaos: { n: '???', t: 240, hz: 1.25, tz: 6.25, wz: 12.5, combo: 1, tv: 1, kn: 1, fg: 1, wv: 2, dm: 3, ch: 1, rn: [800, -8, -30], c: 0x888888, sh: 6 }
+};
+let DS = null, GAP = 180, TX = 0, TZ = 0;
+const RNUM = 500, RP = new Float32Array(RNUM * 6), RV = new Float32Array(RNUM * 3), RG = new THREE.BufferGeometry();
+RG.setAttribute('position', new THREE.BufferAttribute(RP, 3));
+const RAIN = new THREE.LineSegments(RG, new THREE.LineBasicMaterial({ color: 0xcfe0ff, transparent: true, opacity: .45 }));
+RAIN.frustumCulled = false; RAIN.visible = false; sc.add(RAIN);
+for (let i = 0; i < RNUM; i++) { RV[i * 3] = (Math.random() - .5) * 40; RV[i * 3 + 1] = Math.random() * 22; RV[i * 3 + 2] = (Math.random() - .5) * 40; }
+const TORN = new THREE.Mesh(new THREE.CylinderGeometry(.3, 2.4, 14, 12, 1, true), new THREE.MeshLambertMaterial({ color: 0xdddddd, transparent: true, opacity: .35, side: THREE.DoubleSide }));
+TORN.visible = false; sc.add(TORN);
+const WAVE = new THREE.Mesh(new THREE.BoxGeometry(70, 7, 4), new THREE.MeshLambertMaterial({ color: 0x2d6ea6, transparent: true, opacity: .75 }));
+WAVE.position.y = 3.5; WAVE.visible = false; sc.add(WAVE);
+const DBAN = document.createElement('div');
+DBAN.style.cssText = 'position:fixed;top:64px;left:50%;transform:translateX(-50%);background:rgba(0,0,0,.6);padding:8px 18px;border-radius:8px;font-weight:700;display:none;white-space:nowrap;pointer-events:none';
+document.body.appendChild(DBAN);
+const CV = ren.domElement;
+function startDis() {
+  const r = Math.random(), pool = r < .45 ? ['rain', 'downpour', 'wind'] : r < .75 ? ['tornado1', 'tsunami1', 'fog'] : ['tornado2', 'tsunami2', 'death', 'chaos'];
+  const id = pool[Math.floor(Math.random() * pool.length)];
+  DS = { d: DIS[id], left: DIS[id].t, el: 0, tk: 0, bt: 0, bt2: 0 };
+  msg('⚠ ' + DIS[id].n + '!');
+}
+// Есть ли над головой блок: если да, стихия не бьёт
+function covered() {
+  for (let y = Math.round(P.y + 1.8); y <= 16; y++) if (solid(Math.round(P.x), y, Math.round(P.z))) return true;
+  return false;
+}
+function rainUpd(dt, vx, vy2, n) {
+  RAIN.visible = n > 0; if (!n) return;
+  RAIN.geometry.setDrawRange(0, n * 2);
+  for (let i = 0; i < n; i++) {
+    const j = i * 3;
+    let x = RV[j] + vx * dt, y = RV[j + 1] + vy2 * dt, z = RV[j + 2];
+    if (y < 0) y += 22;
+    x = P.x + ((x - P.x + 20) % 40 + 40) % 40 - 20; z = P.z + ((z - P.z + 20) % 40 + 40) % 40 - 20;
+    RV[j] = x; RV[j + 1] = y; RV[j + 2] = z;
+    const q = i * 6;
+    RP[q] = x; RP[q + 1] = y; RP[q + 2] = z; RP[q + 3] = x - vx * .04; RP[q + 4] = y - vy2 * .04; RP[q + 5] = z;
+  }
+  RG.attributes.position.needsUpdate = true;
+}
+// Волна и торнадо опасной категории ломают блоки (кроме воды и пустоты)
+// Разрушение блоков стихиями. Блок с прочностью ≤ inst ломается сразу; иначе получает dmg урона (он копится) и ломается, когда урон ≥ прочности
+const BHARD = { ladder: .2, stone: 3, white: 4, kremen: 5, log: 1, planks: 1, leaves: .2, gold: 15, diamond: 6, silver: 16, titan: 25, takurit: 50 };
+const BSTORM = {
+  tornado1: { tor: [{ inst: 3, dmg: 3 }] },
+  tornado2: { tor: [{ inst: 5.5, dmg: 0 }] },
+  tsunami1: { wav: [{ inst: 3, dmg: 3 }] },
+  tsunami2: { wav: [{ inst: 5, dmg: 5 }] },
+  death: { mul: 4, tor: [{ inst: 3, dmg: 3 }, { inst: 5.5, dmg: 0 }], wav: [{ inst: 3, dmg: 3 }, { inst: 5, dmg: 5 }] },
+  chaos: { mul: 5, tor: [{ inst: 3, dmg: 3 }, { inst: 5.5, dmg: 0 }], wav: [{ inst: 3, dmg: 3 }, { inst: 5, dmg: 5 }] },
+};
+const BDMG = new Map(), BTCH = new Map();   // накопленный урон и время последнего касания по блокам
+let DSTK = -9, DSWV = -9;
+function stormSet() { if (!DS) return null; const sid = Object.keys(DIS).find(k => DIS[k] === DS.d); return BSTORM[sid] || null; }
+function touchBlock(x, y, z, effs, mul, wave) {
+  if (!DS) return;
+  const key = x + ',' + y + ',' + z, now = DS.el;
+  if (now - (BTCH.get(key) ?? -9) < 1) return;   // один блок касается не чаще раза в секунду
+  const tb = getB(x, y, z);
+  let hv = BHARD[tb];
+  if (hv === undefined && wave && (tb === 'grass' || tb === 'dirt')) hv = .5;   // цунами ломает траву и землю на Y1 и выше
+  if (hv === undefined) return;   // трава, земля, вода, печка, котёл, барьер не ломаются стихиями
+  BTCH.set(key, now);
+  for (const e of effs) {
+    const I = e.inst * mul, D = e.dmg * mul;
+    if (hv <= I || (D > 0 && (BDMG.get(key) || 0) + D >= hv)) { BDMG.delete(key); setB(x, y, z, ''); markDirty(x, z); return; }
+    if (D > 0) BDMG.set(key, (BDMG.get(key) || 0) + D);
+  }
+}
+function destroyBand(z0, rate) {   // цунами: полоса вдоль фронта волны
+  const sb = stormSet(); if (!sb || !sb.wav) return;
+  const el = DS.el; if (el < DSWV || el - DSWV >= .25) DSWV = el; else return;
+  const zc = Math.round(z0), m = sb.mul || 1;
+  for (let x = -36; x <= 36; x++) for (let z = zc - 2; z <= zc + 2; z++) for (let y = 1; y <= 8; y++) if (getB(x, y, z)) touchBlock(x, y, z, sb.wav, m, true);
+}
+function destroyRound(cx, cz, r, rate) {   // торнадо: касание в радиусе 3 блоков
+  const sb = stormSet(); if (!sb || !sb.tor || DS.tdead) return;
+  const el = DS.el; if (el < DSTK || el - DSTK >= .5) DSTK = el; else return;
+  const X0 = Math.round(cx), Z0 = Math.round(cz), m = sb.mul || 1;
+  for (let x = X0 - 3; x <= X0 + 3; x++) for (let z = Z0 - 3; z <= Z0 + 3; z++) {
+    if ((x - cx) * (x - cx) + (z - cz) * (z - cz) > 9) continue;
+    for (let y = 1; y <= 14; y++) if (getB(x, y, z)) touchBlock(x, y, z, sb.tor, m);
+  }
+}
+// Лава (??? ): 10 урона блокам в радиусе 1.5 от места падения
+function lavaHit(x, gy, z) {
+  if (!DS) return;
+  const X = Math.round(x), Z = Math.round(z), Y = Math.floor(gy);
+  for (let a = -1; a <= 1; a++) for (let b = -1; b <= 1; b++) for (let y = Y - 1; y <= Y + 1; y++)
+    if (a * a + b * b <= 2 && getB(X + a, y, Z + b)) touchBlock(X + a, y, Z + b, [{ inst: 0, dmg: 10 }], 1);
+}
+// Толчок игрока в случайную сторону (если там нет блоков); в прыжок, если стоит на земле
+function knock(fogHit) {
+  const a = Math.random() * Math.PI * 2, nx = P.x + Math.cos(a) * 2.5, nz = P.z + Math.sin(a) * 2.5;
+  if (!col(nx, P.y, P.z)) P.x = nx;
+  if (!col(P.x, P.y, nz)) P.z = nz;
+  if (gr) vy = 6;
+  if (fogHit) HP -= 1;
+}
+function updDis(dt) {
+  if (DS) {
+    DS.el += dt; DS.left -= dt; DS.tk -= dt;
+    if (DS.thp === undefined && TORN_HPC[discId()]) DS.thp = TORN_HPC[discId()];
+    if (DS.tdead && (DS.tdt -= dt) <= 0) { DS.tdead = false; DS.thp = TORN_HPC[discId()]; msg('Торнадо вернулся'); }
+    if (DS.left <= 0) { msg('Бедствие закончилось'); DS = null; GAP = 180; BDMG.clear(); BTCH.clear(); DSTK = DSWV = -9; }
+  } else if (!MP.ws && (GAP -= dt) <= 0) startDis();
+  if (MP.ws) GAP = (!DS && MP.next) ? Math.max(0, (MP.next - (Date.now() + MP.off)) / 1000) : 180;
+  const d = DS ? DS.d : null;
+  DBAN.style.display = (DS || GAP < 20) ? 'block' : 'none';
+  DBAN.textContent = DS ? d.n + ' · ' + Math.ceil(DS.left) + ' с' : 'Приближается стихийное бедствие: ' + Math.ceil(GAP) + ' с';
+  TORNG.visible = !!(d && (d.tn || d.tv)) && !(DS && DS.tdead); WAVE.visible = !!(d && d.wv);
+  if (d && (d.tn || d.tv)) { TX = Math.sin(DS.el * .25) * 25; TZ = Math.cos(DS.el * .2) * 25; TORNG.position.set(TX, 0, TZ); updTornado(dt); }
+  if (d && d.wv) WAVE.position.z = -36 + 72 * DS.el / d.t;
+  const zone = !d ? false : d.combo ? true : d.tn ? Math.hypot(P.x - TX, P.z - TZ) < 9 : d.wv ? Math.abs(P.z - WAVE.position.z) < 2.5 : true;
+  if (d && zone && !covered()) { let h = d.hz || 0; if (d.combo) { if (Math.hypot(P.x - TX, P.z - TZ) < 9) h += d.tz || 0; if (Math.abs(P.z - WAVE.position.z) < 2.5) h += d.wz || 0; } HP -= h * dt * (d.ch ? 1 + DS.el / 120 : 1); }
+  if (d && d.wv && !d.combo && zone && !col(P.x, P.y, P.z + 3 * dt)) P.z += 3 * dt;
+  const rn = d && d.rn ? d.rn : [0, 0, 0];
+  rainUpd(dt, rn[1], rn[2], rn[0]);
+  sc.fog.near = d && d.fg ? 4 : 30; sc.fog.far = d && d.fg ? 26 : 75;
+  sc.background.lerp(new THREE.Color(d ? d.c : 0x87b8e8), Math.min(1, dt * 1.5));
+  sc.fog.color.copy(sc.background);
+  if (AMB && AC) AMB.gain.setTargetAtTime(d ? (d.combo || d.hz > .3 ? .14 : .05) : 0, AC.currentTime, .8);
+  CV.style.filter = d && d.ch ? 'hue-rotate(' + ((performance.now() / 1000 * 90) % 360) + 'deg) saturate(' + (1.5 + Math.random()) + ')' : '';
+  const sh = d && d.sh ? d.sh : 0;
+  CV.style.transform = sh ? 'translate(' + ((Math.random() - .5) * 2 * sh) + 'px,' + ((Math.random() - .5) * 2 * sh) + 'px)' : '';
+  if (d && (d.kn || d.fg) && DS.tk <= 0) { DS.tk = d.fg ? 8 : 2.5; if (zone) knock(!!d.fg && !covered()); }
+  if (d && d.wv && (DS.bt -= dt) <= 0) { DS.bt = .25; destroyBand(WAVE.position.z, d.wv * .25); }
+  if (d && d.dm && (DS.bt2 -= dt) <= 0) { DS.bt2 = .25; destroyRound(TX, TZ, 3, d.dm * .25); }
+  updFall(dt, d);
+}
+/* Меню миров и сохранения. Миры хранятся в памяти браузера: блоки, печки, котлы, инвентарь, полоски */
+let MEM = {};
+try { MEM = JSON.parse(window.name || '{}') || {}; } catch (e) {}
+const ST = {
+  get: k => { try { return localStorage.getItem(k); } catch (e) { return MEM[k] ?? null; } },
+  set: (k, v) => { try { localStorage.setItem(k, v); } catch (e) { MEM[k] = v; try { window.name = JSON.stringify(MEM); } catch (e2) {} } }
+};
+let WORLDS = [], CUR = null;
+try { WORLDS = JSON.parse(ST.get('ch_worlds') || '[]') || []; } catch (e) { WORLDS = []; }
+const saveWorlds = () => ST.set('ch_worlds', JSON.stringify(WORLDS));
+const MENUO = document.createElement('div');
+MENUO.style.cssText = 'position:fixed;inset:0;z-index:60;display:none;flex-direction:column;align-items:center;justify-content:center;background:rgba(10,20,30,.55);color:#fff;text-align:center;padding:20px;box-sizing:border-box;overflow:auto';
+document.body.appendChild(MENUO);
+function showMain() {
+  MENUO.innerHTML = `<h1 style="font-size:56px;margin:0;letter-spacing:2px;text-shadow:0 4px 18px #000">Disaster Survival</h1><p style="opacity:.7">Тест чанков, шаг 2h</p><p><button data-a='worlds' style='font-size:20px;padding:10px 30px'>▶ Миры</button> <button data-a='mp' style='font-size:20px;padding:10px 30px'>Мультиплеер</button></p>`;
+}
+function showWorlds() {
+  const rows = WORLDS.map(w => `<div style='margin:6px;display:flex;gap:8px;align-items:center;justify-content:center;flex-wrap:wrap'><b>${w.name}</b><span style='opacity:.6'>сид: ${w.seed}</span><button data-e='${w.id}'>Войти</button><button data-d='${w.id}'>✖</button></div>`).join('') || '<p>Миров пока нет</p>';
+  MENUO.innerHTML = `<h2 style="margin:0">Миры</h2><div style="margin:10px;max-height:45vh;overflow:auto">${rows}</div><div><input id='wn' placeholder='Название' style='font-size:16px;padding:6px;width:160px'> <input id='ws' placeholder='Сид (пусто = случайный)' style='font-size:16px;padding:6px;width:200px'> <button data-a='create'>Создать</button> <button data-a='admin'>Админ-панель</button> <button data-a='back'>Назад</button></div>`;
+}
+MENUO.onclick = e => {
+  const b = e.target.closest('button'); if (!b) return;
+  if (b.dataset.a === 'worlds') { snd('pop'); return showWorlds(); }
+  if (b.dataset.a === 'mp') return showMp();
+  if (b.dataset.a === 'mpgo') return startMp();
+  if (b.dataset.a === 'mproom') { ST.set('ch_room', b.dataset.r); return startMp(); }
+  if (b.dataset.a === 'mpcreate') { const n = (document.getElementById('mpnew').value || '').trim(); if (!n) return alert('Введи название комнаты'); ST.set('ch_room', n); return startMp(); }
+  if (b.dataset.a === 'admin') return openAdmin();
+  if (b.dataset.a === 'back') return showMain();
+  if (b.dataset.a === 'create') {
+    const name = document.getElementById('wn').value.trim() || 'Мир';
+    const seed = document.getElementById('ws').value.trim() || String(Math.floor(Math.random() * 1e9));
+    const w = { id: Date.now().toString(36), name, seed, data: null };
+    WORLDS.push(w); saveWorlds(); return enterWorld(w.id);
+  }
+  if (b.dataset.e) return enterWorld(b.dataset.e);
+  if (b.dataset.d) { const i = WORLDS.findIndex(w => w.id === b.dataset.d); if (i >= 0) WORLDS.splice(i, 1); saveWorlds(); showWorlds(); }
+};
+function enterWorld(id) { ST.set('ch_play', id); location.reload(); }
+function toMenu() { saveCur(); ST.set('ch_play', ''); location.reload(); }
+function saveCur() {
+  if (!CUR) return;
+  CUR.data = { m: saveMods(), f: [...FURN.entries()], c: [...CAUL.entries()], hot: HOT, hp: HP, fd: FD, wt: WT, p: [P.x, P.y, P.z] };
+  ST.set('ch_profile', JSON.stringify(HOT));
+  saveWorlds();
+}
+function restoreData(d) {
+  loadMods(d.m || []);
+  FURN.clear(); for (const [k, f] of d.f || []) FURN.set(k, f);
+  CAUL.clear(); for (const [k, v] of d.c || []) CAUL.set(k, v);
+  if (d.hot) d.hot.forEach((v, i) => { if (i < HOT.length) HOT[i] = v; });
+  if (d.hp != null) { HP = d.hp; FD = d.fd; WT = d.wt; }
+  if (d.p) { P.x = d.p[0]; P.y = d.p[1]; P.z = d.p[2]; }
+}
+/* Общий инвентарь браузера: одинаковый во всех мирах и комнатах */
+function loadProfile() {
+  let pr = null;
+  try { pr = JSON.parse(ST.get('ch_profile') || 'null'); } catch (e) { pr = null; }
+  if (Array.isArray(pr)) pr.forEach((v, i) => { if (i < HOT.length) HOT[i] = v; });
+}
+function bootGame() {
+  const id = ST.get('ch_play') || '';
+  CUR = WORLDS.find(w => w.id === id) || null;
+  initWorld(CUR ? CUR.seed : String(Math.random()));
+  if (CUR && CUR.data) restoreData(CUR.data);
+  loadProfile();
+  if (CUR && (ADM.items.length || ADM.dis)) { ADM.items.forEach(([id, n]) => giveItem(id, n)); if (ADM.dis) startDisId(ADM.dis); ADM = { items: [], dis: null }; saveAdm(); }
+  if (CUR) MENUO.style.display = 'none';
+  else { showMain(); MENUO.style.display = 'flex'; }
+  if (CUR && CUR.id === 'mp') mpConnect();
+  setInterval(saveCur, 20000);
+  addEventListener('pagehide', saveCur);
+}
+/* Графика: текстуры блоков (атлас), иконки, рука с инструментом, камера меню */
+var ATLAS_READY = false;
+const nz = (g, c1, c2, n, a) => { for (let i = 0; i < n; i++) { g.globalAlpha = Math.random() * a; g.fillStyle = Math.random() < .5 ? c1 : c2; g.fillRect(Math.random() * 32 | 0, Math.random() * 32 | 0, 2, 2); } g.globalAlpha = 1; };
+const TILES = [
+  g => { g.fillStyle = '#4f8a33'; g.fillRect(0, 0, 32, 32); nz(g, '#3d7027', '#6aa84a', 500, .7); },
+  g => { g.fillStyle = '#7a5230'; g.fillRect(0, 0, 32, 32); nz(g, '#5a3a20', '#94683e', 250, .5); g.fillStyle = '#4f8a33'; g.fillRect(0, 0, 32, 9); nz(g, '#3d7027', '#6aa84a', 120, .8); for (let x = 0; x < 32; x += 3) g.fillRect(x, 9, 2, 2 + (Math.random() * 4 | 0)); },
+  g => { g.fillStyle = '#7a5230'; g.fillRect(0, 0, 32, 32); nz(g, '#5a3a20', '#9a6a40', 400, .6); },
+  g => { g.fillStyle = '#7f7f86'; g.fillRect(0, 0, 32, 32); nz(g, '#5e5e66', '#a0a0a8', 400, .7); g.strokeStyle = '#5a5a62'; g.beginPath(); g.moveTo(4, 10); g.lineTo(14, 16); g.lineTo(26, 12); g.stroke(); },
+  g => { g.fillStyle = '#e9e9e1'; g.fillRect(0, 0, 32, 32); nz(g, '#cfcfc4', '#fff', 300, .8); g.strokeStyle = '#bdbdb2'; for (let y = 0; y < 32; y += 8) { g.beginPath(); g.moveTo(0, y); g.lineTo(32, y); g.stroke(); } },
+  g => { g.fillStyle = '#0c0c0e'; g.fillRect(0, 0, 32, 32); nz(g, '#1c1c20', '#2a2a30', 300, .8); for (let i = 0; i < 10; i++) { g.fillStyle = Math.random() < .5 ? '#fff' : '#9fd6ff'; g.fillRect(Math.random() * 30 | 0, Math.random() * 30 | 0, 2, 2); } },
+  g => { g.fillStyle = '#c08c4c'; g.fillRect(0, 0, 32, 32); nz(g, '#a8763a', '#d8a866', 200, .5); g.fillStyle = '#7a4e24'; for (let y = 0; y < 32; y += 8) g.fillRect(0, y, 32, 1); },
+  g => { g.fillStyle = '#6b4424'; g.fillRect(0, 0, 32, 32); for (let x = 0; x < 32; x += 4) { g.fillStyle = Math.random() < .5 ? '#55341a' : '#7d5230'; g.fillRect(x, 0, 2, 32); } },
+  g => { g.fillStyle = '#c79a5c'; g.fillRect(0, 0, 32, 32); g.strokeStyle = '#8a5c32'; g.lineWidth = 1.2; for (let r = 3; r < 16; r += 3) { g.beginPath(); g.arc(16, 16, r, 0, 7); g.stroke(); } },
+  g => { g.fillStyle = '#2e7a2e'; g.fillRect(0, 0, 32, 32); nz(g, '#1f5a1f', '#4fa04f', 500, .9); },
+  g => { g.fillStyle = '#8a8a8a'; g.fillRect(0, 0, 32, 32); nz(g, '#6a6a6a', '#a8a8a8', 300, .6); g.fillStyle = '#1a1410'; g.fillRect(7, 14, 18, 14); },
+  g => { g.fillStyle = '#4a4a50'; g.fillRect(0, 0, 32, 32); nz(g, '#2e2e34', '#66666e', 300, .7); g.fillStyle = '#1a1a1e'; g.fillRect(6, 6, 20, 20); },
+  g => { g.fillStyle = '#3a8fd6'; g.fillRect(0, 0, 32, 32); nz(g, '#2d6ea6', '#6fb6ee', 200, .6); },
+  g => { g.fillStyle = '#7f7f86'; g.fillRect(0, 0, 32, 32); nz(g, '#5e5e66', '#a0a0a8', 300, .6); for (let i = 0; i < 9; i++) { g.fillStyle = '#f0c040'; g.fillRect(Math.random() * 28 | 0, Math.random() * 28 | 0, 3, 3); } },
+  g => { g.fillStyle = '#7f7f86'; g.fillRect(0, 0, 32, 32); nz(g, '#5e5e66', '#a0a0a8', 300, .6); for (let i = 0; i < 9; i++) { g.fillStyle = '#7ef0ff'; g.fillRect(Math.random() * 28 | 0, Math.random() * 28 | 0, 3, 3); } },
+  g => { g.fillStyle = '#7f7f86'; g.fillRect(0, 0, 32, 32); nz(g, '#5e5e66', '#a0a0a8', 300, .6); for (let i = 0; i < 9; i++) { g.fillStyle = '#d8dde4'; g.fillRect(Math.random() * 28 | 0, Math.random() * 28 | 0, 3, 3); } },
+  g => { g.fillStyle = '#7f7f86'; g.fillRect(0, 0, 32, 32); nz(g, '#5e5e66', '#a0a0a8', 300, .6); for (let i = 0; i < 9; i++) { g.fillStyle = '#c8d0d8'; g.fillRect(Math.random() * 28 | 0, Math.random() * 28 | 0, 3, 3); } },
+  g => { g.fillStyle = '#2a1a3a'; g.fillRect(0, 0, 32, 32); nz(g, '#1a0f26', '#3a2a4a', 300, .6); for (let i = 0; i < 9; i++) { g.fillStyle = '#b07aff'; g.fillRect(Math.random() * 28 | 0, Math.random() * 28 | 0, 3, 3); } },
+  g => { g.fillStyle = '#111114'; g.fillRect(0, 0, 32, 32); nz(g, '#050507', '#2a2a32', 400, .8); },
+  g => { g.fillStyle = '#9a6a3a'; g.fillRect(0, 0, 32, 32); nz(g, '#7a4f2a', '#b8844e', 300, .5); g.strokeStyle = '#4a2e14'; g.lineWidth = 2; g.strokeRect(4, 4, 24, 24); g.strokeRect(4, 17, 24, 11); },
+  g => { g.fillStyle = '#3d6b3a'; g.fillRect(0, 0, 32, 32); nz(g, '#2e5229', '#5a8a55', 200, .5); g.fillStyle = '#25301f'; for (let y = 4; y < 32; y += 7) g.fillRect(0, y, 32, 2); g.fillStyle = '#9aa3ad'; g.fillRect(2, 2, 28, 2); }
+];
+// Номера плиток атласа: 0 трава сверху, 1 трава сбоку, 2 земля, 3 камень, 4 белый камень, 5 кремень, 6 доски, 7 бревно сбоку, 8 срез бревна, 9 листва, 10 печка, 11 котёл, 12 вода
+const TILE = { dirt: 2, stone: 3, white: 4, kremen: 5, planks: 6, leaves: 9, furnace: 10, cauldron: 11, water: 12, gold: 13, diamond: 14, silver: 15, titan: 16, takurit: 17, bedrock: 18, bin: 20 };
+const ATLAS_C = document.createElement('canvas'); ATLAS_C.width = 32 * TILES.length; ATLAS_C.height = 32;
+const AG = ATLAS_C.getContext('2d');
+TILES.forEach((paint, i) => { const pc = document.createElement('canvas'); pc.width = pc.height = 32; paint(pc.getContext('2d')); AG.drawImage(pc, i * 32, 0); });
+const ATEX = new THREE.CanvasTexture(ATLAS_C); ATEX.magFilter = THREE.NearestFilter; ATEX.minFilter = THREE.NearestFilter;
+ATEX.encoding = THREE.sRGBEncoding;
+const LCANV = document.createElement('canvas'); LCANV.width = LCANV.height = 32;
+const LG = LCANV.getContext('2d'); LG.clearRect(0, 0, 32, 32); LG.fillStyle = '#9b7440';
+LG.fillRect(3, 0, 4, 32); LG.fillRect(25, 0, 4, 32); for (let y = 3; y < 32; y += 7) LG.fillRect(3, y, 26, 3);
+const LTEX = new THREE.CanvasTexture(LCANV); LTEX.magFilter = THREE.NearestFilter; LTEX.minFilter = THREE.NearestFilter;
+const DOOR_GEO = new THREE.BoxGeometry(.9, 1, .12), DOOR_MAT = new THREE.MeshLambertMaterial({ color: 0x9a6a3a });
+const LADDER_GEO = new THREE.BoxGeometry(.8, 1, .1), LADDER_MAT = new THREE.MeshLambertMaterial({ map: LTEX, alphaTest: .5, side: THREE.DoubleSide });
+ATLAS_READY = true;
+function tileOf(t, ax, s) {
+  if (t === 'grass') return ax === 1 ? (s > 0 ? 0 : 2) : 1;
+  if (t === 'log') return ax === 1 ? 8 : 7;
+  return TILE[t] !== undefined ? TILE[t] : 2;
+}
+function mkMesh2(pos, uv, col, water) {
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
+  g.setAttribute('color', new THREE.Float32BufferAttribute(col, 3));
+  g.computeVertexNormals();
+  const mesh = water
+    ? new THREE.Mesh(g, new THREE.MeshLambertMaterial({ map: ATEX, color: 0xffffff, side: THREE.DoubleSide, transparent: true, opacity: .75 }))
+    : new THREE.Mesh(g, new THREE.MeshLambertMaterial({ map: ATEX, color: 0xffffff, vertexColors: true, side: THREE.DoubleSide }));
+  mesh.castShadow = !water; mesh.receiveShadow = !water;
+  return mesh;
+}
+// Меш чанка с текстурами (заменяет версию из шага 1b)
+function buildChunk(cx, cz) {
+  const key = cx + ',' + cz;
+  if (MESH.has(key)) dropChunk(key);
+  const sp = [], su = [], sc_ = [], wp = [], wu = [], wc = [], N = TILES.length, lds = [], dl = [];
+  for (let x = cx * CS; x < cx * CS + CS; x++)
+    for (let z = cz * CS; z < cz * CS + CS; z++) {
+      const c = colInfo(x, z); if (!c) continue;
+      for (let y = 7; y >= -c.dp; y--) {
+        const t = getB(x, y, z); if (!t) continue;
+        if (t === 'doora') { dl.push([x, y, z]); continue; }
+        if (t === 'ladder') { lds.push([x, y, z]); continue; }
+        const wat = t === 'water', PP = wat ? wp : sp, UU = wat ? wu : su, CC = wat ? wc : sc_;
+        for (const [ax, s] of FACE_DEFS) {
+          const nt = getB(x + (ax === 0 ? s : 0), y + (ax === 1 ? s : 0), z + (ax === 2 ? s : 0));
+          if (nt && nt !== 'ladder' && nt !== 'doora' && (nt !== 'water' || wat)) continue;
+          const tile = tileOf(t, ax, s), u0 = tile / N, u1 = (tile + 1) / N;
+          const UV = [[u0, 0], [u1, 0], [u1, 1], [u0, 1]];
+          const sh = ax === 1 ? (s > 0 ? 1 : .6) : ax === 0 ? .8 : .7;
+          for (const i of QI) {
+            const [u, v] = QC[i], p = [0, 0, 0];
+            p[ax] = s * .5; p[(ax + 1) % 3] = u; p[(ax + 2) % 3] = v;
+            PP.push(x + p[0], y + p[1], z + p[2]);
+            UU.push(UV[i][0], UV[i][1]);
+            CC.push(sh, sh, sh);
+          }
+        }
+      }
+    }
+  const grp = new THREE.Group();
+  if (sp.length) grp.add(mkMesh2(sp, su, sc_, false));
+  if (wp.length) grp.add(mkMesh2(wp, wu, wc, true));
+  for (const [dx, dy, dz] of dl) { const dm = new THREE.Mesh(DOOR_GEO, DOOR_MAT); dm.position.set(dx, dy, dz - .44); grp.add(dm); }
+  for (const [lx, ly, lz] of lds) { const lm = new THREE.Mesh(LADDER_GEO, LADDER_MAT); lm.position.set(lx, ly, lz); grp.add(lm); }
+  sc.add(grp); MESH.set(key, grp);
+}
+// Иконки: плитка атласа для блоков, нарисованные значки для инструментов и мяса
+const ICONC = {};
+const ICON_DRAW = {
+  pick: g => { g.lineCap = 'round'; g.strokeStyle = '#6b4424'; g.lineWidth = 5; g.beginPath(); g.moveTo(10, 42); g.lineTo(32, 18); g.stroke(); g.strokeStyle = '#4b4f55'; g.lineWidth = 7; g.beginPath(); g.moveTo(6, 20); g.quadraticCurveTo(26, -2, 44, 18); g.stroke(); },
+  axe: g => { g.lineCap = 'round'; g.strokeStyle = '#6b4424'; g.lineWidth = 5; g.beginPath(); g.moveTo(12, 44); g.lineTo(28, 22); g.stroke(); g.fillStyle = '#8f9399'; g.strokeStyle = '#4b4f55'; g.lineWidth = 2; g.beginPath(); g.moveTo(22, 20); g.lineTo(44, 8); g.lineTo(42, 30); g.lineTo(28, 28); g.closePath(); g.fill(); g.stroke(); },
+  sword: g => { g.lineCap = 'round'; g.strokeStyle = '#dfe6ee'; g.lineWidth = 6; g.beginPath(); g.moveTo(16, 32); g.lineTo(40, 8); g.stroke(); g.strokeStyle = '#c9a24a'; g.lineWidth = 4; g.beginPath(); g.moveTo(11, 27); g.lineTo(21, 37); g.stroke(); g.strokeStyle = '#5a3a1e'; g.beginPath(); g.moveTo(16, 32); g.lineTo(7, 41); g.stroke(); },
+  stick: g => { g.lineCap = 'round'; g.strokeStyle = '#8a5c32'; g.lineWidth = 5; g.beginPath(); g.moveTo(10, 40); g.lineTo(38, 10); g.stroke(); },
+  pork: g => { g.fillStyle = '#e88a9a'; g.beginPath(); g.ellipse(24, 26, 16, 11, 0, 0, 7); g.fill(); },
+  chicken: g => { g.fillStyle = '#e3b07a'; g.beginPath(); g.ellipse(22, 28, 12, 9, 0, 0, 7); g.fill(); },
+  steak: g => { g.fillStyle = '#a33a2a'; g.beginPath(); g.ellipse(24, 24, 18, 13, .3, 0, 7); g.fill(); },
+  cpork: g => { g.fillStyle = '#9a5a2a'; g.beginPath(); g.ellipse(24, 26, 16, 11, 0, 0, 7); g.fill(); },
+  cchicken: g => { g.fillStyle = '#b8793a'; g.beginPath(); g.ellipse(22, 28, 12, 9, 0, 0, 7); g.fill(); },
+  csteak: g => { g.fillStyle = '#5a2a1a'; g.beginPath(); g.ellipse(24, 24, 18, 13, .3, 0, 7); g.fill(); },
+  cauldronW: g => { g.fillStyle = '#55555c'; g.fillRect(8, 14, 32, 26); g.fillStyle = '#3a8fd6'; g.fillRect(10, 16, 28, 10); }
+};
+const ICON_TILE = { dirt: 2, stone: 3, white: 4, kremen: 5, planks: 6, log: 7, furnace: 10, cauldron: 11, gold: 13, diamond: 14, silver: 15, titan: 16, takurit: 17, bin: 20 };
+const PICK_HEADC = { dpick: '#7ef0ff', spick: '#d8dde4', gpick: '#f0c040', tpick: '#c8d0d8', kpick: '#b07aff' };
+for (const k in PICK_HEADC) ICON_DRAW[k] = g => { ICON_DRAW.pick(g); g.lineCap = 'round'; g.strokeStyle = PICK_HEADC[k]; g.lineWidth = 5; g.beginPath(); g.moveTo(6, 20); g.quadraticCurveTo(26, -2, 44, 18); g.stroke(); };
+ICON_DRAW.ladder = g => { g.strokeStyle = '#8a5c32'; g.lineWidth = 4; g.beginPath(); g.moveTo(14, 4); g.lineTo(14, 44); g.moveTo(34, 4); g.lineTo(34, 44); g.stroke(); g.lineWidth = 3; for (let y = 10; y < 44; y += 8) { g.beginPath(); g.moveTo(14, y); g.lineTo(34, y); g.stroke(); } };
+ICON_DRAW.metal = g => { g.fillStyle = '#9aa3ad'; g.fillRect(6, 16, 36, 18); g.fillStyle = '#cfd6de'; g.fillRect(10, 18, 28, 6); g.fillStyle = '#6d7680'; g.fillRect(6, 30, 36, 4); };
+ICON_DRAW.car = g => { g.fillStyle = '#2b4a7a'; g.fillRect(6, 22, 36, 12); g.fillStyle = '#1a2530'; g.fillRect(14, 12, 20, 10); g.fillStyle = '#151515'; g.fillRect(9, 32, 7, 6); g.fillRect(32, 32, 7, 6); };
+function iconOf(id) {
+  if (ICONC[id]) return ICONC[id];
+  const c = document.createElement('canvas'); c.width = c.height = 40;
+  const g = c.getContext('2d'); g.imageSmoothingEnabled = false;
+  if (ICON_TILE[id] !== undefined) g.drawImage(ATLAS_C, ICON_TILE[id] * 32, 0, 32, 32, 0, 0, 40, 40);
+  else if (ICON_DRAW[id]) { g.save(); g.scale(40 / 48, 40 / 48); ICON_DRAW[id](g); g.restore(); }
+  return ICONC[id] = c.toDataURL();
+}
+function drawHot() {
+  if (!ATLAS_READY) return;
+  HBS.forEach((d, i) => {
+    const s = HOT[i];
+    d.style.borderColor = i === SLOT ? '#ffd54a' : '#333';
+    d.style.position = 'relative';
+    d.innerHTML = '<span style="opacity:.6">' + (i + 1) + '</span>' + (s ? '<img src="' + iconOf(s.id) + '" style="width:28px;height:28px;image-rendering:pixelated"><b style="position:absolute;right:2px;bottom:0;font-size:11px;text-shadow:0 1px 2px #000">' + s.n + '</b>' : '');
+  });
+}
+// Рука и инструмент в руке
+const ARM = new THREE.Mesh(new THREE.BoxGeometry(.13, .13, .42), new THREE.MeshLambertMaterial({ color: 0xe0b08a }));
+const bxm = (w, h, d, col, x, y, z, rz = 0) => { const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), new THREE.MeshLambertMaterial({ color: col })); m.position.set(x, y, z); m.rotation.z = rz; return m; };
+const TOOLG = { axe: new THREE.Group(), pick: new THREE.Group(), sword: new THREE.Group() };
+TOOLG.axe.add(bxm(.045, .045, .62, 0x6b4424, 0, 0, -.31), bxm(.2, .15, .04, 0x8d8d8d, .06, .1, -.6, -.25), bxm(.075, .075, .075, 0xc9b07a, 0, 0, -.5));
+TOOLG.pick.add(bxm(.045, .045, .62, 0x6b4424, 0, 0, -.31), bxm(.36, .04, .05, 0x9a9a9a, 0, .1, -.6), bxm(.05, .13, .05, 0x9a9a9a, -.17, .04, -.6, .5), bxm(.05, .13, .05, 0x9a9a9a, .17, .04, -.6, -.5));
+TOOLG.sword.add(bxm(.045, .045, .16, 0x5a3a1e, 0, 0, -.1), bxm(.22, .035, .06, 0xd4a94a, 0, 0, -.2), bxm(.05, .014, .5, 0xdfe6ee, 0, 0, -.5), bxm(.06, .06, .06, 0xd4a94a, 0, 0, -.01));
+for (const k in TOOLG) { TOOLG[k].position.set(0, .02, -.05); TOOLG[k].rotation.x = -.15; }
+const HANDG = new THREE.Group();
+HANDG.add(ARM, TOOLG.axe, TOOLG.pick, TOOLG.sword);
+HANDG.position.set(.32, -.3, -.55);
+sc.add(cam); cam.add(HANDG);
+// Освещение из старой версии: солнце с мягкими тенями следует за игроком, небо даёт общий свет
+const SUN = new THREE.DirectionalLight(0xfff0d0, 1.5);
+SUN.castShadow = true; SUN.shadow.mapSize.set(2048, 2048);
+Object.assign(SUN.shadow.camera, { left: -36, right: 36, top: 36, bottom: -36, far: 160 });
+const HEMI = new THREE.HemisphereLight(0xcfe6ff, 0x4a3a2a, .7);
+const FLT2 = new THREE.PointLight(0xffd9a0, 0, 12, 1.5);
+sc.add(SUN, SUN.target, HEMI, FLT2);
+function updHand(dt) {
+  const on = !!CUR;
+  for (const el of [document.getElementById('hud'), BARS]) el.style.display = on ? '' : 'none';
+  if (!on) DBAN.style.display = 'none';
+  HB.style.display = on ? 'flex' : 'none';
+  MENUO.style.background = on ? 'rgba(10,20,30,.55)' : 'linear-gradient(rgba(10,20,30,.25),rgba(5,10,20,.75))';
+  if (!on && DIST !== 4) DIST = 4;
+  const h = HOT[SLOT], it = h && (h.id === 'axe' || h.id === 'sword' || isPick(h.id)) ? (isPick(h.id) ? 'pick' : h.id) : '';
+  if (h && isPick(h.id) && PKH !== h.id) { PKH = h.id; TOOLG.pick.children.slice(1).forEach(m => { m.material = m.material.clone(); m.material.color.setHex(PICK_HEADN[h.id]); }); }
+  for (const k in TOOLG) TOOLG[k].visible = on && k === it;
+  ARM.material.color.setHex(h && HANDCOL[h.id] !== undefined && !['pick', 'axe', 'sword'].includes(h.id) && !isPick(h.id) ? HANDCOL[h.id] : 0xe0b08a);
+  HANDG.visible = on;
+  updClouds(dt);
+  updBreak(dt);
+  mpTick(dt);
+  MSGEL.textContent = MSG; MSGEL.style.opacity = MT > 0 ? 1 : 0;
+  SUN.position.set(P.x - 25, P.y + 40, P.z + 15); SUN.target.position.set(P.x, P.y, P.z); SUN.target.updateMatrixWorld();
+  FLT2.intensity = FLAME.visible ? 1.2 : 0; FLT2.position.copy(FLAME.position);
+}
+// Камера меню: медленно вращается вокруг острова
+let MA = 0;
+function menuCam(dt) { MA += dt * .08; cam.position.set(Math.cos(MA) * 40, 22, Math.sin(MA) * 40); cam.lookAt(0, 2, 0); }
+/* Пауза (только в одиночном мире), панель крафта, сообщения, лестница, полоски на старых местах */
+let PAUSED = false;
+const PAUSEO = document.createElement('div');
+PAUSEO.style.cssText = 'position:fixed;inset:0;display:none;z-index:45;background:rgba(0,0,0,.6);color:#fff;flex-direction:column;align-items:center;justify-content:center;text-align:center;gap:12px;font-size:16px';
+PAUSEO.innerHTML = `<h2 style='margin:0;font-size:36px;text-shadow:0 4px 18px #000'>Пауза</h2><button data-p='go' style='font-size:20px;padding:10px 36px'>▶ Продолжить</button><div>Прорисовка: <span id='dlab'>${DIST}</span> чанк(ов)</div><input id='dslide' type='range' min='1' max='6' value='${DIST}' style='width:220px'><button data-p='admin' style='font-size:16px'>Админ-панель</button><button data-p='menu' style='font-size:16px'>Выход в меню</button>`;
+document.body.appendChild(PAUSEO);
+PAUSEO.onclick = e => {
+  const b = e.target.closest('button'); if (!b) return;
+  if (b.dataset.p === 'go') closePause();
+  if (b.dataset.p === 'menu') toMenu();
+  if (b.dataset.p === 'admin') openAdmin();
+};
+PAUSEO.addEventListener('input', e => {
+  if (e.target.id === 'dslide') { DIST = +e.target.value; document.getElementById('dlab').textContent = DIST; }
+});
+function openPause() { if (!CUR) return; PAUSED = !MP.ws; PAUSEO.querySelector("[data-p='admin']").style.display = MP.ws ? 'none' : ''; if (document.pointerLockElement) document.exitPointerLock(); PAUSEO.style.display = 'flex'; }
+function closePause() { PAUSED = false; PAUSEO.style.display = 'none'; if (!matchMedia('(pointer:coarse)').matches) ren.domElement.requestPointerLock(); }
+const CRAFTO = document.createElement('div');
+CRAFTO.style.cssText = 'position:fixed;inset:0;display:none;z-index:44;background:rgba(0,0,0,.6);color:#fff;flex-direction:column;align-items:center;justify-content:center;gap:10px;font-size:16px';
+CRAFTO.innerHTML = `<h2 style='margin:0'>Инвентарь и крафт</h2><button data-c='planks'>Доски (1 бревно → 4)</button><button data-c='furnace'>Печка (8 камня)</button><button data-c='cauldron'>Котел (5 камня)</button><button data-c='close'>Закрыть</button>`;
+document.body.appendChild(CRAFTO);
+CRAFTO.onclick = e => {
+  const b = e.target.closest('button'); if (!b) return;
+  const c = b.dataset.c;
+  if (c === 'planks') craftPlanks(); else if (c === 'furnace') craftFurnace(); else if (c === 'cauldron') craftCauldron(); else closeCraft();
+};
+const INVSTYLE = document.createElement('style');
+INVSTYLE.textContent = '.s{width:52px;height:52px;background:rgba(0,0,0,.55);border:2px solid #333;border-radius:6px;position:relative;display:flex;align-items:center;justify-content:center;box-sizing:border-box}.s.sel{border-color:#ffd54a}.s .sw{width:28px;height:28px;border-radius:4px;box-shadow:inset 0 0 0 2px rgba(0,0,0,.35)}.s b{position:absolute;right:4px;bottom:1px;font-size:12px;text-shadow:0 1px 2px #000}.s em{position:absolute;left:4px;top:1px;font-size:10px;opacity:.6;font-style:normal}#ig{display:grid;grid-template-columns:repeat(9,52px);gap:4px;margin:12px 0}#ig .s{cursor:pointer}#invo button{background:#2a3a2a;color:#fff;border:1px solid #6a6;border-radius:6px;padding:8px 12px;cursor:pointer;font-size:14px}@media (max-height:520px){#invo{padding:10px 14px}#invo h2{font-size:18px}.s{width:40px;height:40px}.s .sw{width:22px;height:22px}#ig{grid-template-columns:repeat(9,40px);margin:6px 0}#invo button{padding:5px 9px;font-size:12px}}';
+document.head.appendChild(INVSTYLE);
+const INVO = document.createElement('div');
+INVO.id = 'invo';
+INVO.style.cssText = 'position:fixed;inset:0;display:none;z-index:40;background:rgba(0,0,0,.72);padding:24px;box-sizing:border-box;overflow:auto;pointer-events:auto';
+INVO.innerHTML = `<h2 style='margin:0'>Инвентарь</h2><div id='ig'></div><button data-c='book' style='width:64px;height:64px;font-size:28px;padding:0'>📖</button> <button data-c='close'>Закрыть</button><p style='opacity:.7;font-size:13px'>Клик по слоту меняет его местами с выбранным слотом хотбара. E — закрыть.</p>`;
+document.body.appendChild(INVO);
+const INVG = document.getElementById('ig');
+// Рисуем все 36 слотов; первые 9 — хотбар
+function drawInv() {
+  INVG.innerHTML = HOT.map((s, i) => `<div class="s${i === SLOT ? ' sel' : ''}" data-i="${i}"><em>${i < 9 ? i + 1 : ''}</em>${s ? `<img class="sw" src="${iconOf(s.id)}" title="${ITEM_NAME[s.id] || ''}"><b>${s.n > 1 ? s.n : ''}</b>` : ''}</div>`).join('');
+}
+INVG.onpointerdown = e => {
+  const d = e.target.closest('[data-i]'); if (!d) return;
+  const i = +d.dataset.i, t = HOT[i];
+  HOT[i] = HOT[SLOT]; HOT[SLOT] = t;
+  drawInv(); drawHot();
+};
+INVO.onclick = e => {
+  const b = e.target.closest('button'); if (!b) return;
+  const c = b.dataset.c;
+  if (c === 'close') return closeCraft();
+  if (c === 'book') return openBook();
+  if (c === 'planks') craftPlanks(); else if (c === 'furnace') craftFurnace(); else if (c === 'cauldron') craftCauldron(); else if (PICK_MAT[c]) craftPick(c);
+  drawInv(); drawHot();
+};
+const BOOKO = document.createElement('div');
+BOOKO.style.cssText = 'position:fixed;inset:0;display:none;z-index:42;background:rgba(0,0,0,.72);color:#fff;flex-direction:column;align-items:center;justify-content:center;gap:8px;font-size:15px;padding:16px;box-sizing:border-box;overflow:auto';
+BOOKO.innerHTML = `<h2 style='margin:0'>📖 Крафты</h2><button data-c='planks'>Доски: 1 бревно → 4 доски</button><button data-c='furnace'>Печка: 8 камня</button><button data-c='cauldron'>Котел: 5 камня</button><button data-c='dpick'>Алмазная кирка: 2 палки + 3 алмаза</button><button data-c='spick'>Серебряная кирка: 2 палки + 3 серебра</button><button data-c='gpick'>Золотая кирка: 2 палки + 3 золота</button><button data-c='tpick'>Титановая кирка: 2 палки + 3 титана</button><button data-c='kpick'>Такуритовая кирка: 2 палки + 3 такурита</button><button data-c='ladder'>Лестница: 7 палок → 3 лестницы</button><button data-c='car'>Машина NVM-3000: 25 металла, 7 кремня, 50 палок, 4 белого камня, 2 серебра</button><button data-c='bclose'>Назад</button>`;
+document.body.appendChild(BOOKO);
+BOOKO.onclick = e => {
+  const b = e.target.closest('button'); if (!b) return;
+  const c = b.dataset.c;
+  if (c === 'bclose') { BOOKO.style.display = 'none'; return; }
+  if (c === 'car') { craftCar(); drawInv(); drawHot(); return; }
+  if (c === 'ladder') { craftLadder(); drawInv(); drawHot(); return; }
+  if (c === 'planks') craftPlanks(); else if (c === 'furnace') craftFurnace(); else if (c === 'cauldron') craftCauldron(); else if (PICK_MAT[c]) craftPick(c);
+  drawInv(); drawHot();
+};
+function craftLadder() {
+  if (pkCount('stick') < 7) return msg('Для лестниц нужно 7 палок');
+  pkSpend('stick', 7); giveItem('ladder', 3); msg('Крафт: 3 лестницы');
+}
+/* ===== Машина NVM-3000 ===== */
+const CAR_HP = 3000;   /* прочность машины */
+const CARS = new Map();       /* id -> машина (меш и состояние) */
+let SEAT = null;              /* { id, seat }: где сидит игрок, seat 0 = водитель */
+let CARSEND = 0, CARSEQ = 0, JOYSAVE = '', ACTS = null;
+const CB = { f: 0, b: 0, l: 0, r: 0 };   /* нажатые кнопки педалей на телефоне */
+const BTNCSS = 'position:absolute;background:rgba(0,0,0,.5);color:#fff;border:1px solid #555;border-radius:10px;font-size:16px';
+/* Вперёд и назад: вертикально, слева снизу на месте джойстика */
+const CARPADV = document.createElement('div');
+CARPADV.style.cssText = 'position:fixed;left:18px;bottom:64px;width:120px;height:120px;display:none;z-index:21';
+CARPADV.innerHTML = `<button data-cb='f' style='${BTNCSS};left:0;bottom:64px;width:120px;height:56px'>▲ Вперёд</button><button data-cb='b' style='${BTNCSS};left:0;bottom:0;width:120px;height:56px'>▼ Назад</button>`;
+/* Влево и вправо: горизонтально, справа снизу */
+const CARPADH = document.createElement('div');
+CARPADH.style.cssText = 'position:fixed;right:12px;bottom:70px;width:230px;height:72px;display:none;z-index:21';
+CARPADH.innerHTML = `<button data-cb='l' style='${BTNCSS};left:0;top:0;width:74px;height:72px'>◀ Влево</button><button data-cb='x' style='${BTNCSS};left:78px;top:0;width:74px;height:72px;background:rgba(120,30,30,.6)'>Выйти</button><button data-cb='r' style='${BTNCSS};left:156px;top:0;width:74px;height:72px'>Вправо ▶</button>`;
+document.body.appendChild(CARPADV);
+document.body.appendChild(CARPADH);
+const CBID = {};
+for (const pad of [CARPADV, CARPADH]) pad.addEventListener('pointerdown', e => {
+  const b = e.target.closest('button'); if (!b) return;
+  e.preventDefault();
+  if (b.dataset.cb === 'x') { if (SEAT) carExit(); return; }
+  CB[b.dataset.cb] = 1; CBID[b.dataset.cb] = e.pointerId;
+});
+const cbRelease = e => { for (const k in CBID) if (CBID[k] === e.pointerId) { CB[k] = 0; delete CBID[k]; } };
+addEventListener('pointerup', cbRelease);
+addEventListener('pointercancel', cbRelease);
+/* места в салоне: [лево-право, перед-зад] относительно центра машины; перед машины смотрит в -z */
+const SEAT_OFF = [[-.45, -.5], [.45, -.5], [-.45, .7], [.45, .7]];
+function seatPos(c, seat) {
+  const lx = SEAT_OFF[seat][0], lz = SEAT_OFF[seat][1], s = Math.sin(c.yaw), co = Math.cos(c.yaw);
+  return [c.x + lx * co + lz * s, c.z - lx * s + lz * co];
+}
+function carSend(t, obj) { if (MP.ws && MP.ws.readyState === 1) MP.ws.send(JSON.stringify(Object.assign({ t }, obj))); }
+function carMesh() {
+  const g = new THREE.Group();
+  const paint = new THREE.MeshLambertMaterial({ color: 0x2b4a7a }), glass = new THREE.MeshLambertMaterial({ color: 0x9fc4d8, transparent: true, opacity: .4 });
+  const dark = new THREE.MeshLambertMaterial({ color: 0x1b1b1f }), seatM = new THREE.MeshLambertMaterial({ color: 0x4a3a2c }), tyre = new THREE.MeshLambertMaterial({ color: 0x151515 });
+  const add = (w, hh, d, x, y, z, m) => { const b = new THREE.Mesh(new THREE.BoxGeometry(w, hh, d), m); b.position.set(x, y, z); b.castShadow = true; g.add(b); };
+  add(2.0, .5, 4.2, 0, .45, 0, paint);            /* днище */
+  add(1.9, .1, 2.5, 0, 1.5, .1, paint);           /* крыша */
+  add(.06, .75, 2.4, -.97, 1.05, .1, glass);      /* левое окно */
+  add(.06, .75, 2.4, .97, 1.05, .1, glass);       /* правое окно */
+  add(1.8, .75, .06, 0, 1.05, -1.1, glass);       /* лобовое стекло */
+  add(1.8, .75, .06, 0, 1.05, 1.35, glass);       /* заднее стекло */
+  add(1.9, .3, 1.1, 0, .72, -1.65, paint);        /* капот */
+  add(2.0, .22, .22, 0, .4, -2.15, dark);         /* передний бампер */
+  add(2.0, .22, .22, 0, .4, 2.15, dark);          /* задний бампер */
+  for (const [lx, lz] of SEAT_OFF) {
+    add(.5, .16, .5, lx, .8, lz, seatM);          /* сиденье */
+    add(.5, .6, .12, lx, 1.12, lz + .25, seatM);  /* спинка */
+  }
+  for (const [x, z] of [[-1.05, -1.4], [1.05, -1.4], [-1.05, 1.4], [1.05, 1.4]]) add(.35, .6, .6, x, .3, z, tyre);
+  return g;
+}
+function carAdd(c) {
+  c.g = carMesh(); sc.add(c.g);
+  c.v = 0; c.vy = 0; c.tx = c.x; c.ty = c.y; c.tz = c.z; c.tyaw = c.yaw;
+  c.seats = c.seats || [null, null, null, null];
+  CARS.set(c.id, c);
+  carRender(0);
+}
+function carNew(x, y, z, yaw, hp) {
+  if (MP.ws && MP.ws.readyState === 1) return carSend('carnew', { x, y, z, yaw, hp });
+  carAdd({ id: 'L' + (++CARSEQ), x, y, z, yaw, hp: Math.max(1, Math.min(CAR_HP, hp || CAR_HP)), owner: UID, seats: [null, null, null, null] });
+}
+function carBlocked(x, z, y) {
+  const yb = Math.round(y + .5);
+  for (const [ox, oz] of [[-1, -2.1], [1, -2.1], [-1, 2.1], [1, 2.1]]) if (solid(Math.round(x + ox), yb, Math.round(z + oz))) return true;
+  return false;
+}
+function carFall(c, dt) {
+  const g = groundY(c.x, c.z), onIsland = !!colInfo(Math.round(c.x), Math.round(c.z));
+  if (onIsland && c.y <= g + .01) { c.y = g; c.vy = 0; return; }
+  c.vy = (c.vy || 0) - 26 * dt; c.y += c.vy * dt;
+  if (onIsland && c.y < g) { c.y = g; c.vy = 0; }
+}
+function driveUpdate(dt, c) {
+  const fwd = (KY.KeyW || CB.f ? 1 : 0) - (KY.KeyS || CB.b ? 1 : 0);
+  const trn = (KY.KeyD || CB.r ? 1 : 0) - (KY.KeyA || CB.l ? 1 : 0);
+  c.v = (c.v || 0) + fwd * 6 * dt;
+  if (!fwd) c.v -= c.v * Math.min(1, 1.2 * dt);
+  c.v = Math.max(-4, Math.min(12, c.v));
+  c.yaw -= trn * dt * 1.6 * Math.min(1, Math.abs(c.v) / 4) * (c.v < 0 ? -1 : 1);
+  const nx = c.x - Math.sin(c.yaw) * c.v * dt, nz = c.z - Math.cos(c.yaw) * c.v * dt;
+  if (carBlocked(nx, nz, c.y)) c.v = 0; else { c.x = nx; c.z = nz; }
+  carFall(c, dt);
+  if (c.y < -30) { c.x = 0; c.z = 0; c.y = 3; c.v = 0; c.vy = 0; msg('Машина упала за карту, телепорт в центр'); }
+}
+function carInteract() {
+  if (SEAT) { carExit(); return true; }
+  const h = HOT[SLOT];
+  if (h && h.id === 'car') {
+    const r = ray();
+    if (!r || !r.pl) { msg('Смотри на ровную землю'); return true; }
+    const x = r.pl[0], z = r.pl[2], y = groundY(x, z);
+    if (!colInfo(x, z) || carBlocked(x, z, y)) { msg('Здесь нельзя поставить машину'); return true; }
+    carNew(x, y, z, yaw, h.hp); takeSel(); msg('Машина поставлена, прочность ' + (h.hp ?? CAR_HP) + '/' + CAR_HP);
+    return true;
+  }
+  let best = null, bd = 3.5;
+  for (const c of CARS.values()) { const d = Math.hypot(c.x - P.x, c.z - P.z); if (d < bd) { bd = d; best = c; } }
+  if (best) { carEnter(best); return true; }
+  return false;
+}
+function carEnter(c) {
+  const me = MP.ws ? MP.id : 'local';
+  const idx = c.seats.findIndex(s => s === null);
+  if (idx < 0) { msg('В машине нет свободных мест'); return; }
+  c.seats[idx] = me; SEAT = { id: c.id, seat: idx };
+  JOYSAVE = JOY.style.display;
+  carSend('carseat', { id: c.id, seat: idx, on: true });
+  msg(idx === 0 ? 'За рулём · прочность ' + (c.hp || CAR_HP) + '/' + CAR_HP : 'Ты в машине, место ' + (idx + 1));
+  if (document.pointerLockElement) document.exitPointerLock();
+}
+function carSeatEnd() {
+  SEAT = null; CB.f = CB.b = CB.l = CB.r = 0;
+  JOY.style.display = JOYSAVE; CARPADV.style.display = 'none'; CARPADH.style.display = 'none';
+  (ACTS || []).forEach(b => { b.style.display = ''; });
+  CARHPEL.style.display = 'none';
+}
+function carExit() {
+  const c = CARS.get(SEAT.id);
+  if (c) {
+    c.seats[SEAT.seat] = null;
+    c.tx = c.x; c.ty = c.y; c.tz = c.z; c.tyaw = c.yaw;
+    carSend('carpos', { id: c.id, x: c.x, y: c.y, z: c.z, yaw: c.yaw, hp: c.hp });
+    const s = Math.sin(c.yaw), co = Math.cos(c.yaw);
+    P.x = c.x - 1.6 * co; P.z = c.z + 1.6 * s; P.y = c.y;   /* выходим слева от машины */
+  }
+  carSend('carseat', { id: SEAT.id, seat: SEAT.seat, on: false });
+  carSeatEnd(); msg('Вышел из машины');
+}
+function carTick(dt) {
+  const c = CARS.get(SEAT.id);
+  if (!c) return carSeatEnd();
+  JOY.style.display = 'none';
+  if (!ACTS) ACTS = [...document.querySelectorAll('button')].filter(b => /Ломать|Прыжок|Бег|Взаим/.test(b.textContent));
+  ACTS.forEach(b => { b.style.display = 'none'; });
+  const touch = matchMedia('(pointer:coarse)').matches, drv = SEAT.seat === 0 && touch;
+  CARPADV.style.display = drv ? 'block' : 'none';
+  CARPADH.style.display = touch ? 'block' : 'none';
+  CARPADH.querySelectorAll("[data-cb='l'],[data-cb='r']").forEach(b => { b.style.display = drv ? '' : 'none'; });
+  if (SEAT.seat === 0) {
+    driveUpdate(dt, c); tornadoCar(dt, c);
+    if (!MP.ws && (c.hp ?? CAR_HP) <= 0) { msg('Машина разбита'); carDestroy(c.id); return; }
+    c.tx = c.x; c.ty = c.y; c.tz = c.z; c.tyaw = c.yaw;
+    if (MP.ws) { CARSEND += dt; if (CARSEND >= .1) { CARSEND = 0; carSend('carpos', { id: c.id, x: c.x, y: c.y, z: c.z, yaw: c.yaw, hp: c.hp }); } }
+  }
+  const [px, pz] = seatPos(c, SEAT.seat);
+  CARHPEL.style.display = ''; CARHPEL.textContent = 'Машина: ' + Math.max(0, Math.round(c.hp ?? CAR_HP)) + '/' + CAR_HP;
+  P.x = px; P.z = pz; P.y = c.y - .4;   /* сидим в салоне, а не над крышей */
+}
+function carRender(dt) {
+  for (const c of CARS.values()) {
+    if (!(SEAT && SEAT.id === c.id && SEAT.seat === 0)) {
+      const k = Math.min(1, dt * 8);
+      c.x += (c.tx - c.x) * k; c.y += (c.ty - c.y) * k; c.z += (c.tz - c.z) * k; c.yaw += (c.tyaw - c.yaw) * k;
+    }
+    c.g.position.set(c.x, c.y, c.z); c.g.rotation.y = c.yaw;
+  }
+}
+function craftCar() {
+  const need = [['metal', 25], ['kremen', 7], ['stick', 50], ['white', 4], ['silver', 2]];
+  const miss = need.find(([id, n]) => pkCount(id) < n);
+  if (miss) { msg('Не хватает: ' + ITEM_NAME[miss[0]] + ' (' + pkCount(miss[0]) + '/' + miss[1] + ')'); return; }
+  if (HOT.every(s => s)) { msg('Нет места в инвентаре'); return; }
+  for (const [id, n] of need) pkSpend(id, n);
+  giveItem('car'); msg('Крафт: машина NVM-3000');
+}
+/* ===== Торнадо с хп: машина бьёт его и получает урон, торнадо засасывает и выбрасывает машину ===== */
+const TORN_HPC = { tornado1: 5, tornado2: 10, death: 10, chaos: 10 };     /* хп торнадо по категориям */
+const CAR_TDMG = { tornado1: 3, tornado2: 5.5, death: 22, chaos: 27.5 };  /* урон машине, как блокам */
+function discId() { return DS ? Object.keys(DIS).find(k => DIS[k] === DS.d) : null; }
+function tornHit(dmg) {
+  if (MP.ws) return carSend('thit', { dmg });
+  DS.thp = Math.max(0, (DS.thp ?? 0) - dmg); msg('Торнадо: ' + DS.thp + ' хп');
+  if (DS.thp <= 0) tornDown();
+}
+function tornDown() {   /* одиночная игра: торнадо пропал */
+  const id = discId();
+  if (id === 'death' || id === 'chaos') { DS.tdead = true; DS.tdt = 30; msg('Торнадо рассеялся, скоро вернётся'); return; }
+  msg('Торнадо рассеялся, бедствие закончилось');
+  DS = null; GAP = 180; BDMG.clear(); BTCH.clear(); DSTK = DSWV = -9;
+}
+function tornTrack(dt, v, S) {
+  if (v.tcd > 0) { v.tcd -= dt; return false; }
+  if (!v.tt) {
+    const dist = Math.hypot(v.x - TX, v.z - TZ);
+    if (dist > 6 * S) return false;
+    v.tt = { t: 0, a: Math.atan2(v.z - TZ, v.x - TX), r: Math.max(1, dist), base: v.y, eject: 3 + Math.random() * 3 };
+  }
+  const tt = v.tt;
+  tt.t += dt;
+  const k = Math.min(1, tt.t / 3);            /* поднимает к верху воронки за 3 секунды */
+  tt.r = Math.max(1, tt.r - dt * .8 * S);      /* круг сужается ближе к оси */
+  tt.a += dt * (2 + 4 * S * k);                /* раскручивает всё быстрее */
+  v.x = TX + Math.cos(tt.a) * tt.r; v.z = TZ + Math.sin(tt.a) * tt.r;
+  v.y = tt.base + k * 12;
+  if (tt.t >= tt.eject) {                      /* выкидывает в случайный момент */
+    v.tvx = Math.cos(tt.a) * 14 * S; v.tvz = Math.sin(tt.a) * 14 * S;
+    if (v === P) vy = 8 * S; else v.vy = 8 * S;
+    v.tt = null; v.tcd = 4;
+    msg('Торнадо выбросил!');
+  }
+  return true;
+}
+function tornPlayer(dt) {
+  const id = discId();
+  if (!id || !TORN_HPC[id] || DS.tdead) return false;
+  return tornTrack(dt, P, Math.min(3, 1 + DS.el / 120));
+}
+function flight(dt, v) {
+  if (!(v.tvx || v.tvz)) return;
+  v.x += v.tvx * dt; v.z += v.tvz * dt;
+  const f = Math.max(0, 1 - 1.2 * dt); v.tvx *= f; v.tvz *= f;
+  if (Math.hypot(v.tvx, v.tvz) < .4) { v.tvx = 0; v.tvz = 0; }
+}
+function tornadoCar(dt, c) {
+  const id = discId();
+  if (!id || !TORN_HPC[id] || DS.tdead) return;
+  const dist = Math.hypot(c.x - TX, c.z - TZ), S = Math.min(3, 1 + DS.el / 120);
+  if (dist < 3.2 || c.tt) {   /* машина теряет прочность рядом с торнадо и внутри воронки */
+    c.hp = (c.hp ?? CAR_HP) - CAR_TDMG[id] * dt * 2;
+  }
+  if (!c.tt && dist < 3.2) {  /* касание: торнадо получает 1 хп за удар */
+    c.hitT = (c.hitT || 0) - dt;
+    if (Math.abs(c.v || 0) > 1 && c.hitT <= 0) { c.hitT = 1; tornHit(1); }
+  } else c.hitT = 0;
+  if (!tornTrack(dt, c, S)) flight(dt, c);
+  if (Math.hypot(c.x, c.z) > 72) {   /* за пределами карты — телепорт в центр */
+    c.x = 0; c.z = 0; c.y = 3; c.v = 0; c.vy = 0; c.tvx = 0; c.tvz = 0; c.tt = null;
+    msg('Машину выкинуло за карту, телепорт в центр');
+  }
+}
+/* ===== Владелец машины, забрать, прочность ===== */
+const UID = ST.get('ch_uid') || (() => { const u = 'u' + Math.random().toString(36).slice(2, 10); ST.set('ch_uid', u); return u; })();
+const PICKB = document.createElement('button');
+PICKB.textContent = 'Забрать';
+PICKB.style.cssText = 'position:fixed;top:8px;right:212px;width:96px;height:44px;display:none;z-index:20;font-size:15px;border-radius:8px;background:rgba(0,0,0,.6);color:#fff;border:1px solid #888';
+PICKB.onpointerdown = e => { e.preventDefault(); doPickup(); };
+document.body.appendChild(PICKB);
+const CARHPEL = document.createElement('div');
+CARHPEL.style.cssText = 'position:fixed;top:12px;left:50%;transform:translateX(-50%);background:rgba(0,0,0,.5);padding:4px 10px;border-radius:6px;font-size:13px;pointer-events:none;display:none;z-index:20';
+document.body.appendChild(CARHPEL);
+function carDestroy(id) {
+  const c = CARS.get(id); if (!c) return;
+  if (SEAT && SEAT.id === id) { P.x = c.x - 1.6 * Math.cos(c.yaw); P.z = c.z + 1.6 * Math.sin(c.yaw); P.y = c.y; carSeatEnd(); msg('Машина разбита, ты выбрался'); }
+  sc.remove(c.g); CARS.delete(id);
+}
+function doPickup() {
+  const id = PICKB.dataset.id, c = CARS.get(id);
+  if (!c) return;
+  if (HOT.every(s => s)) { msg('Нет места в инвентаре'); return; }
+  if (MP.ws) { carSend('carpick', { id }); return; }
+  if (c.seats.some(s => s !== null)) { msg('В машине кто-то есть'); return; }
+  carDestroy(id); pickCarItem(c.hp);
+}
+function pickCarItem(hp) {
+  const i = HOT.findIndex(s => !s);
+  if (i < 0) { msg('Нет места в инвентаре'); return false; }
+  HOT[i] = { id: 'car', n: 1, hp: Math.max(1, Math.round(hp ?? CAR_HP)) }; drawHot();
+  msg('Машина в инвентаре, прочность ' + HOT[i].hp + '/' + CAR_HP); return true;
+}
+function carPickUI() {
+  let near = null, bd = 4;
+  if (!SEAT && CUR) for (const c of CARS.values()) { if (c.owner !== UID) continue; const d = Math.hypot(c.x - P.x, c.z - P.z); if (d < bd) { bd = d; near = c; } }
+  PICKB.style.display = near ? '' : 'none';
+  PICKB.dataset.id = near ? near.id : '';
+}
+/* ===== Мусорные баки: содержимое хранится как у печки, синхронизируется по сети ===== */
+const BIN_N = 18;
+let BINK = null;
+function binDefault(x, y, z) { const s = new Array(BIN_N).fill(null); s[0] = { id: 'metal', n: 6 + Math.floor(rnd3(x, y, z, 94) * 20) }; return s; }
+function binGet(x, y, z) {
+  const k = 'b' + x + ',' + y + ',' + z;
+  let st = FURN.get(k);
+  if (!st) { st = { bin: 1, slots: isScrapBin(x, y, z) ? binDefault(x, y, z) : new Array(BIN_N).fill(null) }; FURN.set(k, st); mpSendFst(k, st); }
+  return st;
+}
+function binSave(x, y, z, st) { const k = 'b' + x + ',' + y + ',' + z; FURN.set(k, st); mpSendFst(k, st); }
+function placeBin(x, y, z, slots) { binSave(x, y, z, { bin: 1, slots: slots || new Array(BIN_N).fill(null) }); }
+function takeBin(x, y, z) {
+  const k = 'b' + x + ',' + y + ',' + z, st = binGet(x, y, z), i = HOT.findIndex(s => !s);
+  if (i < 0) { setB(x, y, z, 'bin'); markDirty(x, z); msg('Нет места в инвентаре, бак остался на месте'); return; }
+  FURN.delete(k); mpSendFst(k, null);
+  HOT[i] = { id: 'bin', n: 1, bc: st.slots }; drawHot();
+  msg('Мусорный бак в инвентаре');
+}
+function binInteract() {
+  const r = ray(); if (!r || !r.hit) return false;
+  const x = r.hit[0], y = r.hit[1], z = r.hit[2];
+  if (getB(x, y, z) !== 'bin') return false;
+  BINK = [x, y, z]; binGet(x, y, z); drawBin(); BINO.style.display = 'flex';
+  if (document.pointerLockElement) document.exitPointerLock();
+  return true;
+}
+function isStack(it) { return !TOOL_IDS.includes(it.id) && !it.bc && it.hp === undefined; }
+function putItem(it) {   /* из бака в инвентарь */
+  if (!isStack(it)) { const i = HOT.findIndex(s => !s); if (i < 0) return false; HOT[i] = it; return true; }
+  let room = HOT.filter(s => !s).length * 64;
+  for (const s of HOT) if (s && s.id === it.id) room += 64 - s.n;
+  if (room < it.n) return false;
+  giveItem(it.id, it.n); return true;
+}
+function binPut(st, it) {   /* из инвентаря в бак */
+  const stack = isStack(it);
+  let room = st.slots.filter(s => !s).length * (stack ? 64 : 1);
+  if (stack) for (const s of st.slots) if (s && s.id === it.id) room += 64 - s.n;
+  if (room < (stack ? it.n : 1)) return false;
+  if (!stack) { st.slots[st.slots.findIndex(s => !s)] = it; return true; }
+  let n = it.n;
+  for (const s of st.slots) { if (n <= 0) break; if (s && s.id === it.id) { const a = Math.min(64 - s.n, n); s.n += a; n -= a; } }
+  for (let j = 0; n > 0 && j < st.slots.length; j++) if (!st.slots[j]) { const a = Math.min(64, n); st.slots[j] = { id: it.id, n: a }; n -= a; }
+  return true;
+}
+function drawBin() {
+  if (!BINK) return;
+  const st = binGet(BINK[0], BINK[1], BINK[2]);
+  const cell = (it, where, i) => `<div data-bin='${where}' data-i='${i}' style='width:44px;height:44px;position:relative;background:rgba(0,0,0,.55);border:2px solid #333;border-radius:6px;box-sizing:border-box;cursor:pointer'>${it ? `<img src='${iconOf(it.id)}' style='width:32px;height:32px;image-rendering:pixelated;pointer-events:none'><b style='position:absolute;right:2px;bottom:0;font-size:11px;pointer-events:none'>${it.n > 1 ? it.n : ''}</b>` : ''}</div>`;
+  BINO.querySelector('#binslots').innerHTML = st.slots.map((it, i) => cell(it, 'bin', i)).join('');
+  BINO.querySelector('#invslots').innerHTML = HOT.map((it, i) => cell(it, 'inv', i)).join('');
+}
+const BINO = document.createElement('div');
+BINO.style.cssText = 'position:fixed;inset:0;display:none;z-index:43;background:rgba(0,0,0,.72);color:#fff;flex-direction:column;align-items:center;justify-content:center;gap:8px;font-size:14px;padding:12px;box-sizing:border-box;overflow:auto';
+BINO.innerHTML = `<h2 style='margin:0'>🗑 Мусорный бак</h2><div style='opacity:.8;font-size:13px'>Нажми ячейку бака, чтобы забрать вещь. Нажми ячейку инвентаря, чтобы положить.</div><div id='binslots' style='display:grid;grid-template-columns:repeat(6,48px);gap:4px'></div><div style='opacity:.7;font-size:13px'>Инвентарь</div><div id='invslots' style='display:grid;grid-template-columns:repeat(9,48px);gap:4px'></div><button data-close='1'>Закрыть</button>`;
+document.body.appendChild(BINO);
+BINO.onclick = e => {
+  const cl = e.target.closest('button');
+  if (cl && cl.dataset.close) { BINO.style.display = 'none'; BINK = null; return; }
+  const d = e.target.closest('[data-bin]');
+  if (!d || !BINK) return;
+  const x = BINK[0], y = BINK[1], z = BINK[2], st = binGet(x, y, z), i = +d.dataset.i;
+  if (d.dataset.bin === 'bin') {
+    const it = st.slots[i]; if (!it) return;
+    if (!putItem(it)) { msg('Нет места в инвентаре'); return; }
+    st.slots[i] = null;
+  } else {
+    const it = HOT[i]; if (!it) return;
+    if (!binPut(st, it)) { msg('В баке нет места'); return; }
+    HOT[i] = null;
+  }
+  binSave(x, y, z, st); drawBin(); drawHot();
+};
+function openBook() { BOOKO.style.display = 'flex'; }
+function openCraft() {
+  INVO.style.display = 'block'; drawInv();
+  document.documentElement.style.touchAction = document.body.style.touchAction = 'auto';
+  if (document.pointerLockElement) document.exitPointerLock();
+}
+function closeCraft() {
+  INVO.style.display = 'none';
+  document.documentElement.style.touchAction = document.body.style.touchAction = 'none';
+  if (!matchMedia('(pointer:coarse)').matches) ren.domElement.requestPointerLock();
+}
+
+function fsToggle() { const de = document.documentElement; if (!document.fullscreenElement) { const p = de.requestFullscreen && de.requestFullscreen(); if (p && p.catch) p.catch(() => {}); } else if (document.exitFullscreen) document.exitFullscreen(); }
+const MSGEL = document.createElement('div');
+MSGEL.style.cssText = 'position:fixed;top:110px;left:50%;transform:translateX(-50%);background:rgba(0,0,0,.5);padding:4px 10px;border-radius:6px;font-size:13px;opacity:0;transition:opacity .4s;white-space:nowrap;pointer-events:none';
+document.body.appendChild(MSGEL);
+// Лестница: пока стоишь в клетке лестницы, W или Space поднимают, S опускает
+function onLadder() {
+  const X = Math.round(P.x), Z = Math.round(P.z);
+  for (let y = Math.round(P.y); y <= Math.round(P.y + 1.7); y++) if (getB(X, y, Z) === 'ladder') return true;
+  return false;
+}
+const stm = document.createElement('style');
+stm.textContent = '@media (pointer:coarse){#bars{top:40px!important;bottom:auto!important;left:12px!important;width:150px!important}#hud{display:none!important}}';
+document.head.appendChild(stm);
+/* Облака: белые, серые при дожде и ливне, очень тёмные при торнадо */
+const CLOUD_MAT = new THREE.MeshLambertMaterial({ color: 0xffffff, transparent: true, opacity: .92, depthWrite: false });
+const CLOUDS = new THREE.Group(); sc.add(CLOUDS);
+const CLOUD_LIST = [];
+for (let i = 0; i < 42; i++) {
+  const g = new THREE.Group(), n = 4 + Math.floor(Math.random() * 4);
+  for (let k = 0; k < n; k++) {
+    const b = new THREE.Mesh(new THREE.BoxGeometry(5 + Math.random() * 5, 2 + Math.random() * 1.5, 4 + Math.random() * 4), CLOUD_MAT);
+    b.position.set((Math.random() - .5) * 9, (Math.random() - .5) * 1.5, (Math.random() - .5) * 6);
+    g.add(b);
+  }
+  g.position.set((Math.random() - .5) * 180, 36 + Math.random() * 10, (Math.random() - .5) * 180);
+  CLOUDS.add(g); CLOUD_LIST.push(g);
+}
+const CLOUD_TGT = new THREE.Color(0xffffff);
+const wrapv = (v, c, r) => c + (((v - c + r) % (2 * r) + 2 * r) % (2 * r)) - r;
+function updClouds(dt) {
+  const d = DS ? DS.d : null;
+  CLOUD_TGT.set(d && (d.tn || d.tv) ? 0x2b2f33 : (d && (d.n === 'Дождь' || d.n === 'Ливень')) ? 0x8f98a3 : 0xffffff);
+  CLOUD_MAT.color.lerp(CLOUD_TGT, Math.min(1, dt * 1.2));
+  const heavy = !!(d && (d.tn || d.tv || d.n === 'Дождь' || d.n === 'Ливень'));
+  CLOUD_LIST.forEach((g, i) => { g.visible = heavy || i < 14; g.position.x = wrapv(g.position.x + 2 * dt, P.x, 60); g.position.z = wrapv(g.position.z, P.z, 60); });
+}
+/* Торнадо как на фото: тёмная воронка с вращающимися полосами, пыль у основания и обломки */
+const STREAK_C = document.createElement('canvas'); STREAK_C.width = 64; STREAK_C.height = 64;
+const SGX = STREAK_C.getContext('2d'); SGX.fillStyle = '#8a8a8a'; SGX.fillRect(0, 0, 64, 64);
+for (let i = 0; i < 9; i++) { SGX.fillStyle = Math.random() < .5 ? '#2c2c2c' : '#b0b0b0'; SGX.fillRect(i * 8 - 4, 0, 2 + Math.random() * 4, 64); }
+const STREAK_T = new THREE.CanvasTexture(STREAK_C);
+STREAK_T.wrapS = STREAK_T.wrapT = THREE.RepeatWrapping; STREAK_T.repeat.set(3, 3);
+const TORNG = new THREE.Group(); TORNG.visible = false; sc.add(TORNG);
+const FUN_H = 45, SEGS = 9, rAt = y => .8 + Math.pow(y / FUN_H, 1.4) * 9;
+const FUN_MAT = new THREE.MeshLambertMaterial({ map: STREAK_T, color: 0x7a7e84, transparent: true, opacity: .9, side: THREE.DoubleSide, depthWrite: false });
+for (let i = 0; i < SEGS; i++) {
+  const y0 = i * FUN_H / SEGS, y1 = (i + 1) * FUN_H / SEGS;
+  const m = new THREE.Mesh(new THREE.CylinderGeometry(rAt(y1), rAt(y0), FUN_H / SEGS, 16, 1, true), FUN_MAT);
+  m.position.y = (y0 + y1) / 2; TORNG.add(m);
+}
+const DUST = new THREE.Mesh(new THREE.CylinderGeometry(9, 13, 3, 24, 1, true), new THREE.MeshLambertMaterial({ color: 0x6b5f4a, transparent: true, opacity: .6, side: THREE.DoubleSide, depthWrite: false }));
+DUST.position.y = 1.2; TORNG.add(DUST);
+const DEB_N = 500, DEB_P = new Float32Array(DEB_N * 3), DEB = [];
+for (let i = 0; i < DEB_N; i++) DEB.push({ a: Math.random() * 6.28, y: Math.random() * 14, s: 1.5 + Math.random() * 2.5, k: Math.random() });
+const DEB_G = new THREE.BufferGeometry(); DEB_G.setAttribute('position', new THREE.BufferAttribute(DEB_P, 3));
+const DEB_PTS = new THREE.Points(DEB_G, new THREE.PointsMaterial({ color: 0x2e2c28, size: .9, transparent: true, opacity: .9 }));
+DEB_PTS.frustumCulled = false; TORNG.add(DEB_PTS);
+function updTornado(dt) {
+  TORNG.visible = true;
+  STREAK_T.offset.x = (STREAK_T.offset.x + dt * .7) % 1;
+  for (let i = 0; i < DEB_N; i++) {
+    const q = DEB[i];
+    q.a += q.s * dt * (1 + 1.5 * (1 - q.y / 14));
+    q.y += dt * 2.5; if (q.y > 14) { q.y = 0; q.k = Math.random(); }
+    const r = rAt(q.y) * (.7 + q.k * .6) + .6;
+    DEB_P[i * 3] = Math.cos(q.a) * r; DEB_P[i * 3 + 1] = q.y; DEB_P[i * 3 + 2] = Math.sin(q.a) * r;
+  }
+  DEB_G.attributes.position.needsUpdate = true;
+  DUST.rotation.y += dt * 1.5;
+}
+/* Админ-панель: выдача предметов и запуск стихий. В меню действует на следующий вход в мир, в мире — сразу */
+const DIS_KEYS = [['rain', 'Дождь'], ['downpour', 'Ливень'], ['wind', 'Ветер'], ['tornado1', 'Торнадо'], ['tornado2', 'Торнадо 2 кат.'], ['tsunami1', 'Слабое цунами'], ['tsunami2', 'Цунами'], ['fog', 'Туман'], ['death', 'Стихийная смерть'], ['chaos', '???']];
+let ADM = { items: [], dis: null };
+try { ADM = JSON.parse(ST.get('ch_admin') || 'null') || { items: [], dis: null }; } catch (e) {}
+const saveAdm = () => ST.set('ch_admin', JSON.stringify(ADM));
+const ADMSTYLE = document.createElement('style');
+ADMSTYLE.textContent = '#admo button{margin:3px;padding:8px 12px;background:#2a3a2a;color:#fff;border:1px solid #6a6;border-radius:6px;font-size:14px;cursor:pointer}#admo select,#admo input{user-select:text;font-size:15px;padding:5px}@media (max-height:520px){#admo button{padding:5px 9px;font-size:12px}}';
+document.head.appendChild(ADMSTYLE);
+const ADMO = document.createElement('div');
+ADMO.id = 'admo';
+ADMO.style.cssText = 'position:fixed;inset:0;display:none;z-index:70;background:rgba(0,0,0,.85);padding:14px;box-sizing:border-box;overflow:auto;color:#fff;text-align:center';
+ADMO.innerHTML = `<h2 style='margin:4px 0 6px;font-size:22px'>Админ-панель</h2><div id='adm_info' style='opacity:.8;font-size:13px;margin-bottom:8px'></div>
+<div style='margin:8px 0'><b>Выдать предмет</b><br><select id='adm_item'>${Object.keys(ITEM_NAME).map(k => `<option value='${k}'>${ITEM_NAME[k]}</option>`).join('')}</select> <input id='adm_n' type='number' min='1' max='64' value='16' style='width:70px'> <button data-adm='give'>Выдать</button></div>
+<div style='margin:12px 0'><b>Стихия</b><br>${DIS_KEYS.map(([k, n]) => `<button data-adm='dis' data-k='${k}'>${n}</button>`).join('')}<br><button data-adm='stop'>Остановить стихию</button></div>
+<button data-adm='close'>Закрыть</button>`;
+document.body.appendChild(ADMO);
+ADMO.onclick = e => {
+  const b = e.target.closest('button'); if (!b) return;
+  const a = b.dataset.adm;
+  if (a === 'close') return closeAdmin();
+  if (a === 'stop') return stopDisAdm();
+  if (a === 'dis') return startDisAdm(b.dataset.k);
+  if (a === 'give') return giveAdm();
+};
+function refreshAdm() {
+  const info = document.getElementById('adm_info');
+  if (CUR) { info.textContent = 'Мир открыт: выдача и стихия применяются сразу'; return; }
+  const dn = ADM.dis ? (DIS_KEYS.find(k => k[0] === ADM.dis) || [0, ADM.dis])[1] : '';
+  info.textContent = 'В меню: применится к следующему входу в мир' + (ADM.items.length ? ' · предметов: ' + ADM.items.length : '') + (dn ? ' · стихия: ' + dn : '');
+}
+function openAdmin() { if (MP.ws) return; refreshAdm(); ADMO.style.display = 'block'; if (CUR && document.pointerLockElement) document.exitPointerLock(); }
+function closeAdmin() { ADMO.style.display = 'none'; if (CUR && !matchMedia('(pointer:coarse)').matches) ren.domElement.requestPointerLock(); }
+function giveAdm() {
+  const id = document.getElementById('adm_item').value;
+  const n = Math.max(1, Math.min(64, +document.getElementById('adm_n').value || 1));
+  if (CUR) msg(giveItem(id, n) ? 'Выдано: ' + ITEM_NAME[id] + ' ×' + n : 'Нет места в инвентаре');
+  else { ADM.items.push([id, n]); saveAdm(); }
+  refreshAdm();
+}
+function startDisId(k) { DS = { d: DIS[k], left: DIS[k].t, el: 0, tk: 0, bt: 0, bt2: 0 }; msg('⚠ ' + DIS[k].n + '!'); }
+function startDisAdm(k) {
+  if (CUR && MP.ws) MP.ws.send(JSON.stringify({ t: 'dis_set', id: k })); else if (CUR) startDisId(k); else { ADM.dis = k; saveAdm(); }
+  refreshAdm();
+}
+function stopDisAdm() {
+  if (CUR && MP.ws) MP.ws.send(JSON.stringify({ t: 'dis_set', id: null })); else if (CUR) { DS = null; GAP = 180; msg('Стихия остановлена'); }
+  else { ADM.dis = null; saveAdm(); }
+  refreshAdm();
+}
+/* Стихийная смерть и ???: падающие взрывающиеся камни и горящая лава */
+const FALLERS = [], BOOMS = [];
+function impact(f) {
+  if (f.lava) lavaHit(f.x, groundY(f.x, f.z), f.z);
+  const gy = groundY(f.x, f.z), inside = Math.hypot(f.x - P.x, f.z - P.z) < (f.lava ? 1.5 : 2.5) && !covered();
+  if (f.lava) {
+    const X = Math.round(f.x), Y = Math.round(gy - .5), Z = Math.round(f.z), t = getB(X, Y, Z);
+    if (t === 'log' || t === 'planks' || t === 'leaves') { setB(X, Y, Z, ''); markDirty(X, Z); }
+    if (inside) { HP -= 10; msg('Лава: −10'); }
+  } else if (inside) { HP -= 5; msg('Взрыв камня: −5'); }
+  const b = new THREE.Mesh(new THREE.SphereGeometry(1, 8, 6), new THREE.MeshBasicMaterial({ color: f.lava ? 0xff7a1a : 0xffaa33, transparent: true, opacity: .85 }));
+  b.position.set(f.x, gy + .5, f.z); sc.add(b); BOOMS.push({ m: b, t: 0 });
+}
+function updFall(dt, d) {
+  if (!d || !DS) {
+    while (FALLERS.length) sc.remove(FALLERS.pop().m);
+    while (BOOMS.length) sc.remove(BOOMS.pop().m);
+    return;
+  }
+  if (d.combo && (DS.fb = (DS.fb || 0) - dt) <= 0) {
+    DS.fb = d.ch ? .12 : .4;
+    const a = Math.random() * Math.PI * 2, r = Math.random() * 22;
+    const m = new THREE.Mesh(new THREE.BoxGeometry(.6, .6, .6), new THREE.MeshBasicMaterial({ color: d.ch ? 0xff6a1a : 0x4a4a4a }));
+    sc.add(m);
+    FALLERS.push({ m, x: P.x + Math.cos(a) * r, z: P.z + Math.sin(a) * r, y: 32, vy: d.ch ? -16 : -12, lava: !!d.ch });
+  }
+  for (let i = FALLERS.length - 1; i >= 0; i--) {
+    const f = FALLERS[i];
+    f.y += f.vy * dt; f.m.position.set(f.x, f.y, f.z); f.m.rotation.x += dt * 5;
+    if (f.y <= groundY(f.x, f.z)) { impact(f); sc.remove(f.m); FALLERS.splice(i, 1); }
+  }
+  for (let i = BOOMS.length - 1; i >= 0; i--) {
+    const b = BOOMS[i]; b.t += dt; const s = 1 + b.t * 5;
+    b.m.scale.set(s, s, s); b.m.material.opacity = Math.max(0, .85 - b.t * 2.5);
+    if (b.t > .35) { sc.remove(b.m); BOOMS.splice(i, 1); }
+  }
+}
+/* Звуки: синтез в браузере, без файлов */
+let AC = null, AMB = null, STEP_T = 0;
+function initA() {
+  AC = new (window.AudioContext || window.webkitAudioContext)();
+  const b = AC.createBuffer(1, AC.sampleRate * 2, AC.sampleRate), d = b.getChannelData(0);
+  for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+  const s = AC.createBufferSource(), f = AC.createBiquadFilter();
+  s.buffer = b; s.loop = true; f.type = 'lowpass'; f.frequency.value = 600;
+  AMB = AC.createGain(); AMB.gain.value = 0;
+  s.connect(f); f.connect(AMB); AMB.connect(AC.destination); s.start();
+}
+function tone(ty, f1, f2, dur, vol) {
+  const t = AC.currentTime, o = AC.createOscillator(), g = AC.createGain();
+  o.type = ty; o.frequency.setValueAtTime(f1, t); o.frequency.exponentialRampToValueAtTime(f2, t + dur);
+  g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(.001, t + dur);
+  o.connect(g); g.connect(AC.destination); o.start(t); o.stop(t + dur);
+}
+const SND = {
+  hit: () => tone('square', 220, 70, .1, .12), place: () => tone('triangle', 300, 150, .1, .15),
+  pop: () => tone('sine', 500, 900, .12, .15), step: () => tone('triangle', 120, 80, .05, .05),
+  tap: () => tone('square', 600, 500, .03, .08), pig: () => tone('sawtooth', 320, 180, .25, .12),
+  cow: () => tone('sawtooth', 140, 90, .6, .14),
+  chicken: () => { tone('square', 900, 600, .07, .1); setTimeout(() => tone('square', 1000, 650, .07, .1), 90); },
+  ignite: () => { tone('sawtooth', 200, 60, .5, .2); tone('triangle', 1200, 300, .3, .1); }
+};
+function snd(k) { try { if (!AC) initA(); if (AC.state === 'suspended') AC.resume(); if (SND[k]) SND[k](); } catch (e) {} }
+/* Мультиплеер: игроки видны друг другу. Блоки пока локальные (следующий шаг) */
+const MP = { ws: null, id: null, others: new Map(), sendT: 0, off: 0, mobs: new Map() };
+function mpRemove(id) { const o = MP.others.get(id); if (o) { sc.remove(o.g); MP.others.delete(id); } }
+function mpAdd(p) {
+  if (p.id === MP.id) return;
+  if (MP.others.has(p.id)) mpRemove(p.id);
+  const g = new THREE.Group();
+  const body = new THREE.Mesh(new THREE.BoxGeometry(.6, 1.2, .4), new THREE.MeshLambertMaterial({ color: 0x3a6fd6 }));
+  body.position.y = .9; body.castShadow = true; g.add(body);
+  const head = new THREE.Mesh(new THREE.BoxGeometry(.5, .5, .5), new THREE.MeshLambertMaterial({ color: 0xe0b08a }));
+  head.position.y = 1.85; head.castShadow = true; g.add(head);
+  const eyeM = new THREE.MeshBasicMaterial({ color: 0x111111 });
+  for (const ex of [-.13, .13]) { const eye = new THREE.Mesh(new THREE.BoxGeometry(.09, .09, .05), eyeM); eye.position.set(ex, 1.9, .27); g.add(eye); }
+  const hand = new THREE.Mesh(new THREE.BoxGeometry(.22, .22, .22), new THREE.MeshBasicMaterial({ color: 0xffffff }));
+  hand.position.set(.42, 1.0, .35); hand.visible = false; g.add(hand);
+  const c = document.createElement('canvas'); c.width = 256; c.height = 64;
+  const tex = new THREE.CanvasTexture(c);
+  const label = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, depthTest: false }));
+  label.scale.set(2.4, .6, 1); label.position.y = 2.6; g.add(label);
+  g.position.set(p.x, p.y, p.z);
+  sc.add(g);
+  const o = { g, hand, name: p.name, ctx: c.getContext('2d'), tex, hp: -1, hid: '', x: p.x, y: p.y, z: p.z, yaw: p.yaw, tx: p.x, ty: p.y, tz: p.z, tyaw: p.yaw };
+  MP.others.set(p.id, o);
+  mpRefresh(o, p);
+}
+function mpDrawLabel(o) {
+  const x = o.ctx; x.clearRect(0, 0, 256, 64);
+  x.fillStyle = 'rgba(0,0,0,.55)'; x.fillRect(0, 0, 256, 64);
+  x.fillStyle = '#fff'; x.font = 'bold 26px sans-serif'; x.textAlign = 'center'; x.fillText(o.name, 128, 28);
+  x.fillStyle = '#333'; x.fillRect(38, 40, 180, 14);
+  x.fillStyle = o.hp > 40 ? '#d33' : '#f80'; x.fillRect(38, 40, 180 * Math.max(0, Math.min(100, o.hp)) / 100, 14);
+  o.tex.needsUpdate = true;
+}
+function mpRefresh(o, m) {
+  if (m.hp !== undefined && m.hp !== o.hp) { o.hp = m.hp; mpDrawLabel(o); }
+  if (m.hand !== undefined && m.hand !== o.hid) {
+    o.hid = m.hand;
+    const col = HANDCOL[m.hand];
+    o.hand.visible = col !== undefined;
+    if (col !== undefined) o.hand.material.color.setHex(col);
+  }
+}
+function mpConnect() {
+  const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
+  MP.ws = new WebSocket(proto + location.host + '/?room=' + encodeURIComponent(ST.get('ch_room') || 'Главный'));
+  MP.ws.onopen = () => { MP.ws.send(JSON.stringify({ t: 'hello', name: ST.get('ch_name') || 'Игрок', uid: UID })); CHATL.style.display = ''; CHATB.style.display = ''; };
+  MP.ws.onmessage = e => {
+    const m = JSON.parse(e.data);
+    if (m.t === 'welcome') { MP.id = m.id; MP.off = (m.now || Date.now()) - Date.now(); if (m.dis) mpDis(m.dis); MP.next = m.next || 0; if (DS) { DS.thp = m.thp; DS.tdead = !!m.tdead; } MODS.clear(); CHUNKS.forEach(k => DIRTY.add(k)); (m.blocks || []).forEach(([k, v]) => mpApplyBlock(k, v)); FURN.clear(); (m.furn || []).forEach(([k, st]) => FURN.set(k, st)); CAUL.clear(); (m.caul || []).forEach(([k, v]) => CAUL.set(k, v)); CARS.forEach(c => sc.remove(c.g)); CARS.clear(); (m.cars || []).forEach(c => carAdd(c)); m.players.forEach(p => mpAdd(p)); (m.chat || []).forEach(c => addChat(c.name, c.text)); }
+    else if (m.t === 'join') mpAdd(m.p);
+    else if (m.t === 'pos') { const o = MP.others.get(m.id); if (o) { o.tx = m.x; o.ty = m.y; o.tz = m.z; o.tyaw = m.yaw; mpRefresh(o, m); } }
+    else if (m.t === 'blk') mpApplyBlock(m.k, m.v);
+    else if (m.t === 'dis') mpDis(m);
+    else if (m.t === 'mobs') mpMobs(m.list);
+    else if (m.t === 'mobdead') mpMobDead(m.id);
+    else if (m.t === 'loot') mpLoot(m);
+    else if (m.t === 'leave') mpRemove(m.id);
+    else if (m.t === 'chat') addChat(m.name, m.text);
+    else if (m.t === 'fst') { if (m.s) { FURN.set(m.k, m.s); if (FSEL && FSEL.x + ',' + FSEL.y + ',' + FSEL.z === m.k) { FSEL = m.s; if (FOODO.style.display === 'flex') drawFood(); } } else FURN.delete(m.k); }
+    else if (m.t === 'cst') CAUL.set(m.k, m.v);
+    else if (m.t === 'carpicked') pickCarItem(m.hp);
+    else if (m.t === 'cardie') carDestroy(m.id);
+    else if (m.t === 'note') msg(m.text);
+    else if (m.t === 'thp') { if (DS) { DS.thp = m.hp; msg('Торнадо: ' + m.hp + ' хп'); } }
+    else if (m.t === 'tdead') { if (DS) { DS.tdead = m.on; if (m.on) msg('Торнадо рассеялся, скоро вернётся'); else msg('Торнадо вернулся'); } }
+    else if (m.t === 'carnew') carAdd(m.car);
+    else if (m.t === 'carpos') { const c = CARS.get(m.id); if (c) { c.tx = m.x; c.ty = m.y; c.tz = m.z; c.tyaw = m.yaw; if (m.hp !== undefined) c.hp = m.hp; } }
+    else if (m.t === 'carseat') { const c = CARS.get(m.id); if (c) { c.seats = m.seats; if (SEAT && SEAT.id === m.id && m.seats[SEAT.seat] !== MP.id) { carSeatEnd(); msg('Место заняли, ты вышел'); } } }
+  };
+  MP.ws.onclose = () => { [...MP.others.keys()].forEach(mpRemove); };
+}
+function mpTick(dt) {
+  mpMobTick(dt);
+  if (MP.ws && MP.ws.readyState === 1 && (MP.sendT -= dt) <= 0) {
+    MP.sendT = .1;
+    const hh = HOT[SLOT]; MP.ws.send(JSON.stringify({ t: 'pos', x: P.x, y: P.y, z: P.z, yaw: yaw, hp: Math.round(HP), hand: hh ? hh.id : '' }));
+  }
+  const k = Math.min(1, dt * 12);
+  MP.others.forEach(o => {
+    o.x += (o.tx - o.x) * k; o.y += (o.ty - o.y) * k; o.z += (o.tz - o.z) * k;
+    o.g.position.set(o.x, o.y, o.z); o.g.rotation.y = o.tyaw + Math.PI;
+  });
+}
+function showMp() {
+  (async () => {
+    let list = [];
+    try { list = await (await fetch('/rooms')).json(); } catch (e) {}
+    const rows = list.map(r => `<div style='margin:4px'><b>${r.name}</b> <span style='opacity:.6'>игроков: ${r.players}</span> <button data-a='mproom' data-r='${r.name}'>Войти</button></div>`).join('') || "<div style='opacity:.6'>Комнат пока нет</div>";
+    MENUO.innerHTML = `<h2 style='margin:0'>Мультиплеер</h2><p style='opacity:.8;font-size:14px;margin:6px'>Сервер: ${location.host}</p><div style='margin:10px;max-height:35vh;overflow:auto'>${rows}</div><div><input id='mpnew' placeholder='Название новой комнаты' style='font-size:16px;padding:6px;width:220px'> <button data-a='mpcreate'>Создать</button></div><p><button data-a='back'>Назад</button></p>`;
+  })();
+}
+async function startMp() {
+  const name = ((document.getElementById('mpname').value || '').trim() || 'Игрок').slice(0, 16);
+  ST.set('ch_name', name);
+  try {
+    const seed = (await (await fetch('/seed?room=' + encodeURIComponent(ST.get('ch_room') || 'Главный'))).text()).trim();
+    const old = WORLDS.find(w => w.id === 'mp');
+    WORLDS = WORLDS.filter(w => w.id !== 'mp');
+    WORLDS.push({ id: 'mp', name: 'Сервер (сеть)', seed, data: old ? old.data : null });
+    saveWorlds();
+    enterWorld('mp');
+  } catch (e) {
+    alert('Нет связи с сервером. Открой игру по адресу сервера, например http://192.168.1.10:3000');
+  }
+}
+function mpApplyBlock(k, v) {
+  MODS.set(k, v);
+  const q = k.split(',').map(Number);
+  markDirty(q[0], q[2]);
+}
+window.mpSendBlock = (k, v) => { if (MP.ws && MP.ws.readyState === 1) MP.ws.send(JSON.stringify({ t: 'blk', k, v })); };
+/* Погода и мобы из сервера: одни на всех. Урон и предметы считаются у каждого игрока сами */
+function mpDis(m) {
+  if (m.next) MP.next = m.next;
+  if (!m.id) { DS = null; return; }
+  const d = DIS[m.id]; if (!d) return;
+  const el = Math.max(0, (Date.now() + MP.off - m.start) / 1000);
+  if (!DS || DS.d !== d) msg('⚠ ' + d.n + '!');
+  DS = { d, left: Math.max(1, d.t - el), el, tk: 0, bt: 0, bt2: 0 }; if (m.thp !== undefined) DS.thp = m.thp;
+}
+function mpMobs(list) {
+  const seen = new Set();
+  for (const m of list) {
+    seen.add(m.id);
+    let o = MP.mobs.get(m.id);
+    if (!o) { o = { g: animalModel(m.k), k: m.k, x: m.x, z: m.z, h: m.h, tx: m.x, tz: m.z, th: m.h }; MP.mobs.set(m.id, o); }
+    o.tx = m.x; o.tz = m.z; o.th = m.h;
+  }
+  [...MP.mobs.keys()].forEach(id => { if (!seen.has(id)) mpMobDead(id); });
+}
+function mpMobDead(id) { const o = MP.mobs.get(id); if (o) { sc.remove(o.g); MP.mobs.delete(id); } }
+function mpLoot(m) { giveItem(m.k, m.n) ? msg('+' + m.n + ' ' + ITEM_NAME[m.k]) : msg('Инвентарь полон'); }
+function mpMobTick(dt) {
+  const k = Math.min(1, dt * 8);
+  MP.mobs.forEach(o => {
+    o.x += (o.tx - o.x) * k; o.z += (o.tz - o.z) * k;
+    o.g.position.set(o.x, groundY(o.x, o.z), o.z); o.g.rotation.y = o.th;
+  });
+}
+function mpAttack() {
+  const d = new THREE.Vector3(); cam.getWorldDirection(d);
+  let best = null, bt = 3.2;
+  MP.mobs.forEach((o, id) => {
+    const vx = o.x - cam.position.x, vy = groundY(o.x, o.z) + .6 - cam.position.y, vz = o.z - cam.position.z;
+    const t = vx * d.x + vy * d.y + vz * d.z;
+    if (t < 0 || t > bt) return;
+    if (Math.hypot(vx - d.x * t, vy - d.y * t, vz - d.z * t) < .8) { bt = t; best = id; }
+  });
+  if (!best) return false;
+  const h = HOT[SLOT], dmg = !h ? 1 : (isPick(h.id) || h.id === 'axe') ? 2 : 1;
+  MP.ws.send(JSON.stringify({ t: 'hit', id: best, dmg }));
+  snd(MP.mobs.get(best).k);
+  return true;
+}
+/* Цвет предметов в руке и подсказки: время ломания, полоска прогресса, XYZ */
+const HANDCOL = { pick: 0x9a9a9a, axe: 0x8d8d8d, sword: 0xd0d8e0, pork: 0xe88a9a, chicken: 0xe3b07a, steak: 0xa33a2a, cpork: 0x9a5a2a, cchicken: 0xb8793a, csteak: 0x5a2a1a, dirt: 0x7a5230, stone: 0x7f7f86, white: 0xe9e9e1, planks: 0xc08c4c, log: 0x6b4424, kremen: 0x111111, furnace: 0x8a8a8a, cauldron: 0x4a4a50, cauldronW: 0x3a8fd6, stick: 0x8a5c32, gold: 0xf0c040, diamond: 0x7ef0ff, silver: 0xd8dde4, titan: 0xc8d0d8, takurit: 0xb07aff, metal: 0x9aa3ad, dpick: 0x7ef0ff, spick: 0xd8dde4, gpick: 0xf0c040, tpick: 0xc8d0d8, kpick: 0xb07aff };
+let BRK = false, BT = { t: 0, k: '' };
+const BARF = document.createElement('div');
+BARF.style.cssText = 'position:fixed;left:50%;top:calc(50% + 16px);width:70px;height:6px;margin-left:-35px;background:rgba(0,0,0,.5);opacity:0;pointer-events:none';
+BARF.innerHTML = '<i style="display:block;height:100%;width:0;background:#ffd54a"></i>';
+document.body.appendChild(BARF);
+const XYZEL = document.createElement('div');
+XYZEL.style.cssText = 'position:fixed;left:12px;top:12px;background:rgba(0,0,0,.5);padding:4px 8px;border-radius:6px;font-size:13px;pointer-events:none;display:none';
+document.body.appendChild(XYZEL);
+// Время ломания: 1 единица прочности = 1 секунда
+const BLOCK_HARD = { grass: .5, dirt: .5, stone: 3, white: 4, kremen: 5, planks: 1, log: 1, leaves: .2, furnace: 3, cauldron: 3, gold: 15, diamond: 6, silver: 16, titan: 25, takurit: 50, ladder: .3, bin: 10 };
+addEventListener('pointerup', e => { if (e.pointerType !== 'mouse' && e.target && e.target.closest && e.target.closest('button.tb')) BRK = false; });
+addEventListener('mouseup', () => { BRK = false; });
+function updBreak(dt) {
+  const on = !!CUR;
+  const cc = colInfo(P.x, P.z);
+  if (on && P.y < (cc ? -cc.dp - 6 : -6)) { P.x = 0; P.y = 3; P.z = 0; vy = 0; msg('Ты упал за карту, телепорт в центр'); }
+  XYZEL.style.display = on ? '' : 'none';
+  if (on) XYZEL.textContent = 'X ' + Math.round(P.x) + '   Y ' + Math.round(P.y - .5) + '   Z ' + Math.round(P.z);
+  const r = BRK && on ? ray() : null;
+  const info = r && r.hit ? BLOCK_INFO[getB(r.hit[0], r.hit[1], r.hit[2])] : null;
+  if (!info || (info.need && !needOk(info.need))) { BT.t = 0; BT.k = ''; BARF.style.opacity = 0; return; }
+  const bt0 = getB(r.hit[0], r.hit[1], r.hit[2]), key = r.hit.join(','), need = (BLOCK_HARD[bt0] || 1) / (1 + (STONEISH.includes(bt0) ? (PICK_BONUS[held()] || 0) : 0));
+  if (BT.k !== key) { BT.k = key; BT.t = 0; }
+  BT.t += dt;
+  BARF.style.opacity = 1; BARF.firstElementChild.style.width = Math.min(100, BT.t / need * 100) + '%';
+  if (BT.t >= need) { BT.t = 0; BT.k = ''; doBreak(); }
+}
+/* Чат мультиплеера: T или кнопка 💬 — открыть, Enter — отправить, Esc — закрыть */
+const CHATL = document.createElement('div');
+CHATL.style.cssText = 'position:fixed;right:12px;top:62px;width:42vw;max-width:340px;text-align:right;font-size:13px;color:#fff;text-shadow:0 1px 3px #000;pointer-events:none;display:none;z-index:20';
+document.body.appendChild(CHATL);
+const CHATI = document.createElement('input');
+CHATI.maxLength = 200; CHATI.placeholder = 'Сообщение (Enter)';
+CHATI.style.cssText = 'position:fixed;left:50%;bottom:12px;transform:translateX(-50%);width:min(88vw,380px);font-size:16px;padding:8px;display:none;z-index:46';
+document.body.appendChild(CHATI);
+const CHATB = document.createElement('button');
+CHATB.textContent = '💬';
+CHATB.style.cssText = 'position:fixed;right:162px;top:8px;width:44px;height:44px;display:none;z-index:20;font-size:20px;border-radius:8px;background:rgba(0,0,0,.5);color:#fff;border:1px solid #444';
+CHATB.onpointerdown = e => { e.preventDefault(); openChat(); };
+document.body.appendChild(CHATB);
+function addChat(name, text) {
+  const d = document.createElement('div'), b = document.createElement('b');
+  b.textContent = name + ': '; d.appendChild(b); d.appendChild(document.createTextNode(text));
+  CHATL.appendChild(d);
+  while (CHATL.children.length > 8) CHATL.removeChild(CHATL.firstChild);
+}
+function openChat() { if (!MP.ws || PAUSED) return; CHATI.style.display = ''; CHATI.value = ''; CHATI.focus(); if (document.pointerLockElement) document.exitPointerLock(); }
+function closeChat() { CHATI.style.display = 'none'; CHATI.blur(); }
+function sendChat() { const t = CHATI.value.trim(); if (t && MP.ws && MP.ws.readyState === 1) MP.ws.send(JSON.stringify({ t: 'chat', text: t })); closeChat(); }
+CHATI.addEventListener('keydown', e => { e.stopPropagation(); if (e.key === 'Enter') sendChat(); else if (e.key === 'Escape') closeChat(); });
+addEventListener('keydown', e => { if (e.code === 'KeyT' && MP.ws && CHATI.style.display === 'none') { e.preventDefault(); openChat(); } });
+/* Запрет выделения текста и системного меню при долгом касании: мешало водить машину на телефоне */
+const NOSEL = document.createElement('style');
+NOSEL.textContent = 'body, body * { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; } input, textarea { -webkit-user-select: text; user-select: text; } canvas, button { touch-action: none; }';
+document.head.appendChild(NOSEL);
+document.addEventListener('selectstart', e => { if (!(e.target.closest && e.target.closest('input, textarea'))) e.preventDefault(); });
+document.addEventListener('contextmenu', e => { if (!(e.target.closest && e.target.closest('input, textarea'))) e.preventDefault(); });
+bootGame();
+requestAnimationFrame(frame);
+</script></body></html>
