@@ -498,6 +498,7 @@ function jmove(t) {
   JX = x; JZ = -y; KNOB.style.transform = `translate(${x * 40}px,${y * 40}px)`;
 }
 function tStart(e) {
+  if ([BINO, INVO, BOOKO, FOODO].some(el => el && el.style.display && el.style.display !== 'none')) return;
   if (INVO.style.display === 'block' || ADMO.style.display === 'block') return;
   if (e.target.closest && e.target.closest('button,input')) return;
   if (!IS_TOUCH) return;
@@ -510,6 +511,7 @@ function tStart(e) {
   e.preventDefault();
 }
 function tMove(e) {
+  if ([BINO, INVO, BOOKO, FOODO].some(el => el && el.style.display && el.style.display !== 'none')) return;
   if (INVO.style.display === 'block' || ADMO.style.display === 'block') return;
   if (!IS_TOUCH) return;
   for (const t of e.changedTouches) {
@@ -1025,7 +1027,6 @@ function toMenu() { saveCur(); ST.set('ch_play', ''); location.reload(); }
 function saveCur() {
   if (!CUR) return;
   CUR.data = { m: saveMods(), f: [...FURN.entries()], c: [...CAUL.entries()], hot: HOT, hp: HP, fd: FD, wt: WT, p: [P.x, P.y, P.z] };
-  ST.set('ch_profile', JSON.stringify(HOT));
   saveWorlds();
 }
 function restoreData(d) {
@@ -1036,22 +1037,15 @@ function restoreData(d) {
   if (d.hp != null) { HP = d.hp; FD = d.fd; WT = d.wt; }
   if (d.p) { P.x = d.p[0]; P.y = d.p[1]; P.z = d.p[2]; }
 }
-/* Общий инвентарь браузера: одинаковый во всех мирах и комнатах */
-function loadProfile() {
-  let pr = null;
-  try { pr = JSON.parse(ST.get('ch_profile') || 'null'); } catch (e) { pr = null; }
-  if (Array.isArray(pr)) pr.forEach((v, i) => { if (i < HOT.length) HOT[i] = v; });
-}
 function bootGame() {
   const id = ST.get('ch_play') || '';
   CUR = WORLDS.find(w => w.id === id) || null;
   initWorld(CUR ? CUR.seed : String(Math.random()));
   if (CUR && CUR.data) restoreData(CUR.data);
-  loadProfile();
   if (CUR && (ADM.items.length || ADM.dis)) { ADM.items.forEach(([id, n]) => giveItem(id, n)); if (ADM.dis) startDisId(ADM.dis); ADM = { items: [], dis: null }; saveAdm(); }
   if (CUR) MENUO.style.display = 'none';
   else { showMain(); MENUO.style.display = 'flex'; }
-  if (CUR && CUR.id === 'mp') mpConnect();
+  if (CUR && CUR.id.startsWith('mp:')) { ST.set('ch_room', CUR.id.slice(3)); mpConnect(); }
   setInterval(saveCur, 20000);
   addEventListener('pagehide', saveCur);
 }
@@ -1932,11 +1926,11 @@ async function startMp() {
   ST.set('ch_name', name);
   try {
     const seed = (await (await fetch('/seed?room=' + encodeURIComponent(ST.get('ch_room') || 'Главный'))).text()).trim();
-    const old = WORLDS.find(w => w.id === 'mp');
-    WORLDS = WORLDS.filter(w => w.id !== 'mp');
-    WORLDS.push({ id: 'mp', name: 'Сервер (сеть)', seed, data: old ? old.data : null });
+    const roomName = ST.get('ch_room') || 'Главный'; const wid = 'mp:' + roomName; const old = WORLDS.find(w => w.id === wid);
+    WORLDS = WORLDS.filter(w => w.id !== wid);
+    WORLDS.push({ id: wid, name: 'Комната: ' + roomName, seed, data: old ? old.data : null });
     saveWorlds();
-    enterWorld('mp');
+    enterWorld(wid);
   } catch (e) {
     alert('Нет связи с сервером. Открой игру по адресу сервера, например http://192.168.1.10:3000');
   }
